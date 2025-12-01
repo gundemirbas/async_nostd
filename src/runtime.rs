@@ -3,10 +3,71 @@
 //! Bu modül program başlangıcı, future execution ve low-level işlemler için
 //! güvenli wrapper'lar sağlar.
 
-use core::future::Future;
-use core::pin::Pin;
-use core::task::{Context, RawWaker, RawWakerVTable, Waker};
+// no task waker utilities needed in runtime
 use core::panic::PanicInfo;
+
+// Simple mmap-backed global allocator for freestanding builds
+mod mmap_alloc {
+    use core::alloc::{GlobalAlloc, Layout};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::ptr::null_mut;
+
+    const HEAP_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+
+    static HEAP_START: AtomicUsize = AtomicUsize::new(0);
+    static HEAP_CUR: AtomicUsize = AtomicUsize::new(0);
+    static HEAP_END: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe fn init_heap() {
+        if HEAP_START.load(Ordering::SeqCst) == 0 {
+            let ptr = crate::syscall::mmap_alloc(HEAP_SIZE);
+            if !ptr.is_null() {
+                let s = ptr as usize;
+                HEAP_START.store(s, Ordering::SeqCst);
+                HEAP_CUR.store(s, Ordering::SeqCst);
+                HEAP_END.store(s + HEAP_SIZE, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[inline]
+    fn align_up(x: usize, align: usize) -> usize {
+        (x + align - 1) & !(align - 1)
+    }
+
+    pub struct MmapAllocator;
+
+    unsafe impl GlobalAlloc for MmapAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            init_heap();
+            let align = layout.align().max(1);
+            let size = layout.size();
+            if size == 0 {
+                return align as *mut u8;
+            }
+
+            loop {
+                let cur = HEAP_CUR.load(Ordering::SeqCst);
+                let aligned = align_up(cur, align);
+                let next = aligned.checked_add(size).unwrap_or(usize::MAX);
+                let end = HEAP_END.load(Ordering::SeqCst);
+                if next > end {
+                    return null_mut();
+                }
+                if HEAP_CUR.compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                    return aligned as *mut u8;
+                }
+            }
+        }
+
+        unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
+            // no-op bump allocator
+        }
+    }
+
+    #[global_allocator]
+    static ALLOC: MmapAllocator = MmapAllocator;
+}
 
 /// Program entry point - naked function
 #[unsafe(naked)]
@@ -29,7 +90,7 @@ pub extern "C" fn main(argc: isize, argv: *const *const u8) -> ! {
     crate::main(argc, argv)
 }
 
-/// Panic handler - zorunlu no_std için
+/// Panic handler - only for freestanding builds
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     use crate::syscall::exit;
@@ -45,48 +106,29 @@ pub fn read_ptr_array(ptr: *const *const u8, index: isize) -> *const u8 {
     unsafe { *ptr.offset(index) }
 }
 
-/// Dummy waker - no_std ortamında basit executor için
-fn dummy_raw_waker() -> RawWaker {
-    fn no_op(_: *const ()) {}
-    fn clone(_: *const ()) -> RawWaker {
-        dummy_raw_waker()
+/// Parse a null-terminated C string pointer as a decimal usize.
+/// Returns `None` if the pointer is null or the string is empty/invalid.
+pub fn parse_cstring_usize(s: *const u8) -> Option<usize> {
+    if s.is_null() {
+        return None;
     }
-    
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
-    RawWaker::new(core::ptr::null(), &VTABLE)
-}
-
-/// Future executor wrapper - unsafe operasyonları gizler
-pub struct Executor;
-
-impl Executor {
-    /// Yeni bir executor oluştur
-    pub fn new() -> Self {
-        Self
-    }
-    
-    /// Bir future'ı tek seferlik poll et
-    /// 
-    /// Bu basit bir executor implementasyonu, gerçek dünyada
-    /// daha karmaşık bir executor kullanılmalı
-    pub fn block_on<F>(&self, future: &mut F) -> F::Output
-    where
-        F: Future,
-    {
-        // SAFETY: dummy_raw_waker minimal geçerli bir RawWaker oluşturur
-        let waker = unsafe { Waker::from_raw(dummy_raw_waker()) };
-        let mut context = Context::from_waker(&waker);
-        
-        // SAFETY: future referansı geçerli ve poll süresince yaşayacak
-        let mut pinned = unsafe { Pin::new_unchecked(future) };
-        
-        match pinned.as_mut().poll(&mut context) {
-            core::task::Poll::Ready(val) => val,
-            core::task::Poll::Pending => {
-                // Bu basit executor pending durumunu handle etmiyor
-                // Gerçek bir uygulamada bu tekrar poll edilmeli
-                panic!("Future is pending");
-            }
+    // SAFETY: caller provides valid pointer; we bound to a reasonable length
+    unsafe {
+        let mut i: isize = 0;
+        let mut acc: usize = 0;
+        let mut any = false;
+        while i < 64 {
+            let c = *s.offset(i);
+            if c == 0 { break; }
+            if c < b'0' || c > b'9' { break; }
+            any = true;
+            acc = acc * 10 + ((c - b'0') as usize);
+            i += 1;
         }
+        if any { Some(acc) } else { None }
     }
 }
+
+// dummy raw waker removed — runtime does not expose a block_on waker.
+// Executor moved to `executor_clean.rs` to keep runtime free of executor logic.
+ 

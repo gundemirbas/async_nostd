@@ -44,68 +44,48 @@ src/syscall.rs (76 lines)   → System calls - unsafe allowed
 cargo +nightly build --release -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem
 ```
 
-**Why nightly**: Requires unstable features:
-- `build-std`: Build core/alloc from source for custom target
-- `#[unsafe(naked)]` attribute for `_start()`
-- `naked_asm!` macro for naked functions
-
-### Dependencies
-- `futures = { version = "0.3", default-features = false, features = ["async-await"] }`
-- Only `async-await` feature enabled (no executor or std features)
-
-## Development Patterns
-
 ### Adding Unsafe Code
 1. **Never** add unsafe to `main.rs` - it will fail compilation
-2. Low-level syscalls → `syscall.rs`
-3. Runtime/startup code → `runtime.rs`
-4. Wrap unsafe operations in safe public APIs
+## Copilot / AI agent guide — Async Futures Project
 
-Example:
-```rust
-// syscall.rs
-unsafe fn syscall_write(fd: i32, buf: &[u8]) { /* asm */ }
+Quick orientation
+- Purpose: a freestanding `no_std` Rust binary for x86_64 Linux demonstrating async/await with direct syscalls.
+- Key files: `src/main.rs` (application logic — no unsafe), `src/runtime.rs` (startup, allocator, helpers), `src/syscall.rs` (inline asm syscalls), `src/executor.rs` (executor), `x86_64-unknown-linux-none.json`, `linker.ld`, `.cargo/config.toml`.
 
-pub fn write(buf: &[u8]) {
-    unsafe { syscall_write(1, buf) }  // OK here
-}
+Hard rules for agents
+- Never add `unsafe` to `src/main.rs` — it has `#[forbid(unsafe_code)]`.
+- Put raw `asm!` and syscall boundary code in `src/syscall.rs` and expose safe wrappers.
+- Put startup and allocator `unsafe` in `src/runtime.rs` only.
 
-// main.rs
-write(b"Hello");  // Safe API, no unsafe needed
-```
-
-### Adding Application Logic
-- Keep it in `main.rs` with `#[forbid(unsafe_code)]`
-- Use syscall wrappers: `write()`, `exit()`, `print_cstring()`
-- Use runtime helpers: `Executor`, `read_ptr_array()`
-
-### Async Code
-- Use `futures` primitives: `ready()`, `Future` trait
-- Poll via `Executor::block_on()` (simple single-poll executor)
-- Note: Current executor panics on `Pending` - futures must complete immediately
-
-## Testing
-```bash
-# Run with arguments
-./target/x86_64-unknown-linux-none/release/async_futures_project arg1 arg2
-
-# Binary is ~14KB, runs directly on Linux (uses syscalls)
-```
-
-## Common Issues
-
-**"unsafe_code is denied"**: You tried to use unsafe in `main.rs` - move code to `runtime.rs` or `syscall.rs`
-
-**"target not found"**: Need nightly toolchain + rust-src component:
+Build & run (exact)
 ```bash
 rustup toolchain install nightly
 rustup component add rust-src --toolchain nightly
+cargo +nightly build --release -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem
+./target/x86_64-unknown-linux-none/release/async_futures_project <worker_count?>
 ```
 
-**Segfault on startup**: Check `_start()` assembly - stack alignment must be 16-byte
+Project-specific patterns (do this here)
+- Printing: use `crate::syscall::write(b"...\n")` or `print_cstring(ptr)` for argv strings.
+- Reading argv: `runtime::read_ptr_array(argv, idx)` returns `*const u8`.
+- Worker count: `main` parses `argv[1]` as decimal; default is `16`.
+- Spawn tasks: `executor.enqueue_task(Box::new(async move { /* ... */ }))` and `executor.start_workers(n)`.
 
-## Why This Architecture?
-- **Safety**: Enforces unsafe isolation at compile time via `#[forbid(unsafe_code)]`
-- **Clarity**: Physical module boundaries match safety boundaries
-- **Bare-metal**: Demonstrates async/await without OS abstractions
-- **Educational**: Shows exact syscall interface and program startup mechanics
+Executor constraints
+- The executor is minimal: workers poll each boxed future once and expect it to complete (no `Waker`/`Pending` support). A future returning `Poll::Pending` will panic.
+- Task storage uses a `spin::Mutex<Option<Vec<Option<Box<dyn Future<Output=()>>>>>>` global — acceptable for this demo but avoid heavy contention.
+
+Syscall & thread notes
+- `src/syscall.rs:spawn_thread` uses raw `clone` syscall. Do not introduce `CLONE_THREAD` without full thread runtime; current flags use SIGCHLD-like behavior.
+- To add syscalls: place inline `asm!` in `syscall.rs` and wrap with a safe `pub fn`.
+
+Agent-first steps
+1. Run the exact nightly build above to validate toolchain.
+2. Inspect `src/runtime.rs` and `src/syscall.rs` before editing any unsafe code.
+3. Add small feature by editing `main.rs` (safe code) and using syscall/runtime APIs.
+
+Gotchas & tips
+- Output interleaving: tasks call `write()` multiple times (e.g., separate writes for "Task ", id, newline). To avoid interleaving build a single buffer and call `write()` once.
+- `_start()` must align the stack to 16 bytes — incorrect alignment causes segfaults.
+
+If you want more detail (how to implement wake support, structured tests, or a safer task queue), tell me which area to expand and I will update this doc.

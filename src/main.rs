@@ -3,10 +3,14 @@
 
 mod syscall;
 mod runtime;
+mod executor;
 
-use futures::future::ready;
+// futures::ready not needed — example async removed
 use syscall::{write, exit, print_cstring};
-use runtime::{Executor, read_ptr_array};
+use runtime::read_ptr_array;
+use executor::Executor;
+extern crate alloc;
+use alloc::boxed::Box;
 
 /// Sayıyı yazdır
 #[forbid(unsafe_code)]
@@ -70,20 +74,42 @@ fn main(argc: isize, argv: *const *const u8) -> ! {
     
     // Basit async fonksiyon demo
     write(b"\nRunning async function...\n");
-    let mut future = simple_async_function();
-    
-    // Executor ile future'ı çalıştır
+    // Create an executor and run 32 concurrent tasks using cloned workers.
     let executor = Executor::new();
-    let _result = executor.block_on(&mut future);
-    
-    write(b"Async function completed\n");
+
+    // Enqueue 32 simple tasks
+    for i in 0..32 {
+        let fut = async move {
+            write(b"Task ");
+            // print task id
+            print_number(i as isize);
+            write(b" completed\n");
+        };
+
+        // Box the future and enqueue; ignore enqueue errors for simplicity
+        let _ = executor.enqueue_task(Box::new(fut));
+    }
+
+    // Start worker threads (e.g., 4 workers)
+    // Determine worker count from argv[1] (if provided), default to 16
+    let mut worker_count: usize = 16;
+    if argc > 1 {
+        let s = read_ptr_array(argv, 1);
+        if let Some(n) = runtime::parse_cstring_usize(s) {
+            if n > 0 { worker_count = n; }
+        }
+    }
+
+    let _ = executor.start_workers(worker_count);
+
+    // Wait until all tasks complete
+    executor.wait_all();
+
+    write(b"All concurrent tasks completed\n");
     
     exit(0);
 }
 
-// Basit bir async fonksiyon
-#[forbid(unsafe_code)]
-async fn simple_async_function() -> i32 {
-    let value = ready(42).await;
-    value * 2
-}
+// example async func removed — not used in this freestanding build
+
+// No host entrypoint — this project targets a freestanding custom target.
