@@ -46,6 +46,14 @@ fn print_number(n: isize) {
     write(&buf[..i]);
 }
 
+//let fut = async move {
+async fn task_fut(i : isize) {
+    write(b"Task ");
+    // print task id
+    print_number(i as isize);
+    write(b" completed\n");
+}
+
 // Main modülünde unsafe kod yasak (runtime ve syscall modüllerinde izinli)
 #[forbid(unsafe_code)]
 fn main(argc: isize, argv: *const *const u8) -> ! {
@@ -79,15 +87,10 @@ fn main(argc: isize, argv: *const *const u8) -> ! {
 
     // Enqueue 32 simple tasks
     for i in 0..32 {
-        let fut = async move {
-            write(b"Task ");
-            // print task id
-            print_number(i as isize);
-            write(b" completed\n");
-        };
+
 
         // Box the future and enqueue; ignore enqueue errors for simplicity
-        let _ = executor.enqueue_task(Box::new(fut));
+        let _ = executor.enqueue_task(Box::new(task_fut(i)));
     }
 
     // Start worker threads (e.g., 4 workers)
