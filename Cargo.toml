@@ -1,0 +1,13 @@
+[package]
+name = "async_futures_project"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+futures = { version = "0.3", default-features = false, features = ["async-await"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
