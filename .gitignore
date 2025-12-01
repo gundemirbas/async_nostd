@@ -1,1 +1,4 @@
 /target
+
+# Ignore lock files (Cargo.lock, other .lock files)
+*.lock
