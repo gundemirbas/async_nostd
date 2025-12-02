@@ -1,0 +1,11 @@
+[package]
+name = "async-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+async-syscall = { path = "../syscall" }
+spin = { version = "0.10", default-features = false, features = ["mutex", "spin_mutex"] }

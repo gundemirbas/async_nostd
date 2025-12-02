@@ -183,4 +183,26 @@ impl core::future::Future for MyFuture {
 **Optimization tips:**
 - Profile with `opt-level = "z"` for size, `"3"` for speed
 - Check binary size: `ls -lh target/x86_64-unknown-none/release/async-nostd`
-- Use `cargo bloat --release` to find large code sections (requires `cargo-bloat` install)
+- Use `cargo bloat --release` to find large code sections (requires `cargo-bloat` install)         "syscall",
+            in("rax") 39u64,  // __NR_getpid
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    ret as i32
+}
+
+pub fn getpid() -> i32 {
+    unsafe { syscall_getpid() }
+}
+```
+
+**New helper in runtime.rs:**
+```rust
+pub fn some_helper(x: usize) -> usize {
+    unsafe {
+        // Any unsafe operations needed
+    }
+}
+```
