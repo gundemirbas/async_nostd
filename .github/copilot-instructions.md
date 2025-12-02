@@ -1,91 +1,169 @@
 # Async Futures Project - Copilot Instructions
 
 ## Project Overview
-This is a **bare-metal Rust project** targeting `x86_64-unknown-linux-none` with `#![no_std]` and custom syscalls. It demonstrates async/await with futures in a freestanding environment without standard library support.
+Freestanding Rust binary (`#![no_std]`, `#![no_main]`) demonstrating async/await with bare-metal syscalls on x86_64 Linux. **Edition 2024** with strict unsafe isolation.
 
-## Architecture
+## Architecture (4 modules, ~450 LOC)
 
-### Three-Layer Design (Strict Unsafe Isolation)
 ```
-src/main.rs (89 lines)      → Application logic - #[forbid(unsafe_code)]
-src/runtime.rs (92 lines)   → Program startup & executor - unsafe allowed
-src/syscall.rs (76 lines)   → System calls - unsafe allowed
+src/main.rs (91 lines)      → Application logic (no unsafe code)
+src/executor.rs (88 lines)  → Task executor (no unsafe code) 
+src/runtime.rs (134 lines)  → Program startup, allocator, waker (unsafe allowed)
+src/syscall.rs (136 lines)  → Raw Linux syscalls (unsafe allowed)
 ```
 
-**Critical Rule**: `main.rs` uses `#[forbid(unsafe_code)]` - ALL unsafe operations must be in `runtime.rs` or `syscall.rs`.
+**Critical Rule**: `main.rs` and `executor.rs` contain ZERO unsafe code. ALL unsafe operations must be in `runtime.rs` or `syscall.rs` with safe wrapper APIs.
 
 ### Key Components
 
-**runtime.rs** - Program Bootstrap
-- `_start()`: Naked function, sets up stack, jumps to main
-- `#[no_mangle] main()`: C ABI trampoline that calls Rust's `main()`
-- `#[panic_handler]`: Required for no_std
-- `Executor`: Simple future executor (polls once, doesn't handle Pending)
+**runtime.rs** - Unsafe Isolation Layer
+- `_start()`: Naked entry point, 16-byte stack alignment, calls `main()` 
+- `mmap_alloc` module: Bump allocator using mmap syscall (16MB heap)
+- `create_waker()`: Creates dummy waker for executor (no actual wake support)
+- `poll_boxed_future()`: Pins and polls futures (called by executor)
+- `parse_cstring_usize()`, `read_ptr_array()`: Argv parsing helpers
 
-**syscall.rs** - Direct Linux Syscalls
-- `write()`, `exit()`, `print_cstring()`: Safe wrappers over raw syscalls
-- Uses inline assembly (`core::arch::asm!`) for syscall interface
-- All syscalls use `unsafe` internally, exposed as safe functions
+**syscall.rs** - Direct Linux Syscalls  
+- All functions use inline `asm!` for syscall instruction
+- `write()`, `exit()`, `print_cstring()`, `mmap_alloc()`: Exposed as safe APIs
+- `spawn_thread()`: Uses `clone` syscall with CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND
+- **No CLONE_THREAD**: Uses SIGCHLD process model (not pthread-style threads)
 
-**main.rs** - Pure Application Logic
-- `main(argc, argv)`: Entry point (called from runtime trampoline)
-- Uses only safe APIs from runtime/syscall modules
-- Demonstrates async/await with `futures` crate (no_std mode)
+**executor.rs** - Minimal Task Executor
+- Global `TASK_STORAGE`: `spin::Mutex<Vec<Option<Box<dyn Future>>>>` 
+- `worker_trampoline()`: Polls tasks until none remain, then exits
+- **No Pending support**: Tasks MUST complete on first poll or panic
+- Workers spawned via `syscall::spawn_thread()` with 64KB stacks
+
+**main.rs** - Application Entry
+- `main(argc, argv)` never returns (calls `exit()`)
+- Parses `argv[1]` for worker count (default: 16)
+- Spawns 32 async tasks, starts workers, waits for completion
 
 ## Build System
 
-### Custom Target Specification
-- `x86_64-unknown-linux-none.json`: Custom LLVM target (kernel mode, no red zone)
-- `linker.ld`: Custom linker script (entry at 0x400000)
-- `.cargo/config.toml`: Forces custom target + build-std
+### Target Configuration (NO custom JSON/linker needed)
+- **Target**: `x86_64-unknown-none` (standard tier 2 target)
+- **Relocation**: Static linking (`-C relocation-model=static -C code-model=large`)
+- **Binary**: ELF 64-bit LSB executable, statically linked, NOT PIE
+- `.cargo/config.toml` sets target and enables `build-std`
 
 ### Build Command
 ```bash
-cargo +nightly build --release -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem
+cargo +nightly build --release
+# Auto-uses: -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem
 ```
 
-### Adding Unsafe Code
-1. **Never** add unsafe to `main.rs` - it will fail compilation
-## Copilot / AI agent guide — Async Futures Project
-
-Quick orientation
-- Purpose: a freestanding `no_std` Rust binary for x86_64 Linux demonstrating async/await with direct syscalls.
-- Key files: `src/main.rs` (application logic — no unsafe), `src/runtime.rs` (startup, allocator, helpers), `src/syscall.rs` (inline asm syscalls), `src/executor.rs` (executor), `x86_64-unknown-linux-none.json`, `linker.ld`, `.cargo/config.toml`.
-
-Hard rules for agents
-- Never add `unsafe` to `src/main.rs` — it has `#[forbid(unsafe_code)]`.
-- Put raw `asm!` and syscall boundary code in `src/syscall.rs` and expose safe wrappers.
-- Put startup and allocator `unsafe` in `src/runtime.rs` only.
-
-Build & run (exact)
+### Run
 ```bash
-rustup toolchain install nightly
-rustup component add rust-src --toolchain nightly
-cargo +nightly build --release -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem
-./target/x86_64-unknown-linux-none/release/async_futures_project <worker_count?>
+./target/x86_64-unknown-none/release/async_futures_project [worker_count]
+# Example: ./async_futures_project 4
+```
+## Edition 2024 Requirements
+
+### Unsafe Annotations (MANDATORY)
+- `#[no_mangle]` → `#[unsafe(no_mangle)]` (lines 65, 77 in runtime.rs)
+- `#[naked]` → `#[unsafe(naked)]` (line 65 in runtime.rs)
+- Inline `asm!` in unsafe fn → wrap in `unsafe { asm!(...) }` block
+- Example: `syscall.rs` lines 5-16, 19-26, 119-131
+
+## Hard Rules for AI Agents
+
+### Unsafe Code Placement
+1. **NEVER** add `unsafe` to `src/main.rs` or `src/executor.rs`
+2. All `asm!` blocks MUST be in `syscall.rs`, wrapped as safe public functions
+3. Waker/Future polling unsafe code goes in `runtime.rs` (see `create_waker()`, `poll_boxed_future()`)
+4. When adding syscalls: write raw `asm!` in `syscall.rs`, expose safe wrapper
+
+### Common Patterns
+
+**Printing from safe code:**
+```rust
+use crate::syscall::write;
+write(b"Hello\n");  // Safe wrapper over syscall 1 (write)
 ```
 
-Project-specific patterns (do this here)
-- Printing: use `crate::syscall::write(b"...\n")` or `print_cstring(ptr)` for argv strings.
-- Reading argv: `runtime::read_ptr_array(argv, idx)` returns `*const u8`.
-- Worker count: `main` parses `argv[1]` as decimal; default is `16`.
-- Spawn tasks: `executor.enqueue_task(Box::new(async move { /* ... */ }))` and `executor.start_workers(n)`.
+**Argv parsing:**
+```rust
+let arg_ptr = crate::runtime::read_ptr_array(argv, 1);
+if let Some(n) = crate::runtime::parse_cstring_usize(arg_ptr) {
+    // Use n
+}
+```
 
-Executor constraints
-- The executor is minimal: workers poll each boxed future once and expect it to complete (no `Waker`/`Pending` support). A future returning `Poll::Pending` will panic.
-- Task storage uses a `spin::Mutex<Option<Vec<Option<Box<dyn Future<Output=()>>>>>>` global — acceptable for this demo but avoid heavy contention.
+**Spawning async tasks:**
+```rust
+let executor = Executor::new();
+executor.enqueue_task(Box::new(async move {
+    write(b"Task running\n");
+}))?;
+executor.start_workers(4)?;
+executor.wait_all();
+```
 
-Syscall & thread notes
-- `src/syscall.rs:spawn_thread` uses raw `clone` syscall. Do not introduce `CLONE_THREAD` without full thread runtime; current flags use SIGCHLD-like behavior.
-- To add syscalls: place inline `asm!` in `syscall.rs` and wrap with a safe `pub fn`.
+## Critical Constraints
 
-Agent-first steps
-1. Run the exact nightly build above to validate toolchain.
-2. Inspect `src/runtime.rs` and `src/syscall.rs` before editing any unsafe code.
-3. Add small feature by editing `main.rs` (safe code) and using syscall/runtime APIs.
+### Executor Limitations
+- **No `Poll::Pending` support**: Tasks must complete on first poll or will panic
+- Workers poll once per task, then discard completed tasks
+- Use `async fn` or `async {}` blocks that complete immediately
+- Task storage uses global spinlock - avoid heavy contention
 
-Gotchas & tips
-- Output interleaving: tasks call `write()` multiple times (e.g., separate writes for "Task ", id, newline). To avoid interleaving build a single buffer and call `write()` once.
-- `_start()` must align the stack to 16 bytes — incorrect alignment causes segfaults.
+### Thread Model
+- `spawn_thread()` uses `clone` syscall with process-like semantics (SIGCHLD)
+- Each worker gets 64KB stack via `mmap`
+- Workers call `exit(0)` on completion (not pthread_exit)
+- **Do NOT use CLONE_THREAD** - requires full TLS/pthread setup
 
-If you want more detail (how to implement wake support, structured tests, or a safer task queue), tell me which area to expand and I will update this doc.
+### Memory Model  
+- Bump allocator: 16MB heap, no deallocation
+- All allocations permanent until process exit
+- `GlobalAlloc::dealloc` is no-op
+
+## Debugging Tips
+
+**Segfault causes:**
+- Stack misalignment in `_start()` (must be 16-byte aligned)
+- Missing `unsafe { }` wrapper around `asm!` in edition 2024
+- Incorrect `clone` syscall stack pointer
+
+**Output interleaving:**
+- Multiple `write()` calls from concurrent tasks interleave
+- Solution: Build complete message in buffer, single `write()` call
+
+**Task hangs:**
+- Check if futures return `Poll::Pending` (will panic)
+- Verify `TASKS_REMAINING` counter decrements correctly
+
+## Adding Features
+
+**New syscall example:**
+```rust
+// In syscall.rs
+unsafe fn syscall_getpid() -> i32 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 39u64,  // __NR_getpid
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    ret as i32
+}
+
+pub fn getpid() -> i32 {
+    unsafe { syscall_getpid() }
+}
+```
+
+**New helper in runtime.rs:**
+```rust
+pub fn some_helper(x: usize) -> usize {
+    unsafe {
+        // Any unsafe operations needed
+    }
+}
+```
