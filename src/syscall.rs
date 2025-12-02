@@ -87,6 +87,284 @@ pub fn mmap_alloc(size: usize) -> *mut u8 {
     }
 }
 
+// Generic write to fd
+pub fn write_fd(fd: i32, buf: &[u8]) -> isize {
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 1usize,
+            in("rdi") fd as usize,
+            in("rsi") buf.as_ptr(),
+            in("rdx") buf.len(),
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    ret
+}
+
+// Generic read from fd
+#[allow(dead_code)]
+pub fn read_fd(fd: i32, buf: &mut [u8]) -> isize {
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 0usize,
+            in("rdi") fd as usize,
+            in("rsi") buf.as_mut_ptr(),
+            in("rdx") buf.len(),
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    ret
+}
+
+// eventfd2 syscall: returns fd or -1 on error
+pub fn eventfd(initval: u32, flags: i32) -> i32 {
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 290usize,
+            in("rdi") initval as usize,
+            in("rsi") flags as usize,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    if ret < 0 { -1 } else { ret as i32 }
+}
+
+// close syscall
+pub fn close(fd: i32) -> i32 {
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 3usize,
+            in("rdi") fd as usize,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    if ret < 0 { -1 } else { ret as i32 }
+}
+
+// Minimal `pollfd` struct for use with `poll`/`ppoll` wrappers.
+#[repr(C)]
+pub struct PollFd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
+
+// poll syscall wrapper: takes pointer to `PollFd`, number of fds, and timeout in milliseconds.
+// `poll` wrapper removed (unused); `ppoll` is used by the runtime.
+
+// ppoll syscall wrapper. Signature matches Linux ppoll: (struct pollfd *fds, nfds_t nfds,
+// const struct timespec *tmo_p, const sigset_t *sigmask, size_t sigsetsize)
+pub fn ppoll(fds: *mut PollFd, nfds: usize, tmo_p: *const u8, sigmask: *const u8, sigsetsize: usize) -> isize {
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 271usize,
+            in("rdi") fds as usize,
+            in("rsi") nfds,
+            in("rdx") tmo_p as usize,
+            in("r10") sigmask as usize,
+            in("r8") sigsetsize,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    ret
+}
+
+// fcntl syscall wrapper (minimal): int fcntl(int fd, int cmd, long arg);
+pub fn fcntl(fd: i32, cmd: i32, arg: usize) -> isize {
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 72usize,
+            in("rdi") fd as usize,
+            in("rsi") cmd as usize,
+            in("rdx") arg,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    ret
+}
+
+pub const F_SETFL: i32 = 4;
+pub const O_NONBLOCK: usize = 0x800;
+
+// socket syscall: domain, type, protocol -> fd or -1
+pub fn socket(domain: i32, type_: i32, protocol: i32) -> i32 {
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 41usize,
+            in("rdi") domain as usize,
+            in("rsi") type_ as usize,
+            in("rdx") protocol as usize,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    if ret < 0 { -1 } else { ret as i32 }
+}
+
+// socketpair syscall: domain, type, protocol, int sv[2]
+// (removed) socketpair wrapper — unused in current demo
+
+// bind syscall: int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
+pub fn bind(fd: i32, addr: *const u8, addrlen: usize) -> isize {
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 49usize,
+            in("rdi") fd as usize,
+            in("rsi") addr as usize,
+            in("rdx") addrlen,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    ret
+}
+
+// listen syscall: int listen(int sockfd, int backlog);
+pub fn listen(fd: i32, backlog: i32) -> isize {
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 50usize,
+            in("rdi") fd as usize,
+            in("rsi") backlog as usize,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    ret
+}
+
+// accept4 syscall: int accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags);
+pub fn accept4(fd: i32, addr: *mut u8, addrlen: *mut usize, flags: i32) -> isize {
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 288usize,
+            in("rdi") fd as usize,
+            in("rsi") addr as usize,
+            in("rdx") addrlen as usize,
+            in("r10") flags as usize,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    ret
+}
+
+// connect syscall: int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
+pub fn connect(fd: i32, addr: *const u8, addrlen: usize) -> isize {
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 42usize,
+            in("rdi") fd as usize,
+            in("rsi") addr as usize,
+            in("rdx") addrlen,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    ret
+}
+
+// sendto syscall: ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
+//                                 const struct sockaddr *dest_addr, socklen_t addrlen);
+pub fn sendto(fd: i32, buf: *const u8, len: usize, flags: i32, dest: *const u8, addrlen: usize) -> isize {
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 44usize,
+            in("rdi") fd as usize,
+            in("rsi") buf as usize,
+            in("rdx") len,
+            in("r10") flags as usize,
+            in("r8") dest as usize,
+            in("r9") addrlen,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    ret
+}
+
+// recvfrom syscall: ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
+//                                     struct sockaddr *src_addr, socklen_t *addrlen);
+pub fn recvfrom(fd: i32, buf: *mut u8, len: usize, flags: i32, src: *mut u8, addrlen: *mut usize) -> isize {
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 45usize,
+            in("rdi") fd as usize,
+            in("rsi") buf as usize,
+            in("rdx") len,
+            in("r10") flags as usize,
+            in("r8") src as usize,
+            in("r9") addrlen as usize,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    ret
+}
+
+// getsockname syscall: int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
+pub fn getsockname(fd: i32, addr: *mut u8, addrlen: *mut usize) -> isize {
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 51usize,
+            in("rdi") fd as usize,
+            in("rsi") addr as usize,
+            in("rdx") addrlen as usize,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    ret
+}
+
 pub fn spawn_thread(f: extern "C" fn(*mut u8), arg: *mut u8, stack_size: usize) -> Result<(), ()> {
     use core::ptr;
 

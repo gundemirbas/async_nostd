@@ -1,39 +1,16 @@
 use core::future::Future;
 use core::task::{Context, Poll};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use spin::Mutex;
+// `spin::Mutex` is not needed here; runtime provides synchronization.
 
 extern crate alloc;
 use alloc::boxed::Box;
 
 pub struct Executor;
 
+impl Clone for Executor { fn clone(&self) -> Self { Self } }
+
 static TASKS_REMAINING: AtomicUsize = AtomicUsize::new(0);
-static TASK_STORAGE: Mutex<Option<alloc::vec::Vec<Option<Box<dyn Future<Output = ()> + Send + 'static>>>>> =
-    Mutex::new(None);
-
-fn storage_push(task: Box<dyn Future<Output = ()> + Send + 'static>) -> usize {
-    let mut guard = TASK_STORAGE.lock();
-    if guard.is_none() {
-        *guard = Some(alloc::vec::Vec::new());
-    }
-    let storage = guard.as_mut().unwrap();
-    let idx = storage.len();
-    storage.push(Some(task));
-    idx
-}
-
-fn storage_take_first() -> Option<Box<dyn Future<Output = ()> + Send + 'static>> {
-    let mut guard = TASK_STORAGE.lock();
-    if let Some(vec) = guard.as_mut() {
-        for slot in vec.iter_mut() {
-            if slot.is_some() {
-                return slot.take();
-            }
-        }
-    }
-    None
-}
 
 impl Executor {
     pub fn new() -> Self { Self }
@@ -45,7 +22,9 @@ impl Executor {
     }
 
     pub fn enqueue_task(&self, task: Box<dyn Future<Output = ()> + Send + 'static>) -> Result<(), ()> {
-        storage_push(task);
+        // Register the task with the runtime scheduler and increment outstanding counter.
+        // We don't need the returned handle here.
+        let _ = crate::runtime::register_task(task);
         TASKS_REMAINING.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -65,25 +44,28 @@ impl Executor {
 }
 
 extern "C" fn worker_trampoline(_arg: *mut u8) {
-    let waker = unsafe { crate::runtime::create_waker() };
-    let mut cx = Context::from_waker(&waker);
-
+    // Worker loop uses runtime scheduler. It takes a scheduled task handle,
+    // creates a waker for that handle and polls the task via runtime API.
     loop {
         if TASKS_REMAINING.load(Ordering::SeqCst) == 0 {
             break;
         }
 
-        if let Some(mut task) = storage_take_first() {
-            let result = unsafe { crate::runtime::poll_boxed_future(&mut task, &mut cx) };
+        if let Some(handle) = crate::runtime::take_scheduled_task() {
+            let waker = unsafe { crate::runtime::create_waker_for_handle(handle) };
+            let mut cx = Context::from_waker(&waker);
+            let result = unsafe { crate::runtime::poll_task(handle, &mut cx) };
             match result {
-                Poll::Ready(_) => TASKS_REMAINING.fetch_sub(1, Ordering::SeqCst),
-                Poll::Pending => panic!("Task returned Pending"),
-            };
+                Poll::Ready(_) => { TASKS_REMAINING.fetch_sub(1, Ordering::SeqCst); }
+                Poll::Pending => {
+                    // pending tasks will be woken via their Waker (runtime::wake_handle)
+                }
+            }
             continue;
         }
 
-        core::hint::spin_loop();
+        // No scheduled tasks — let runtime poll registered fds and schedule tasks.
+        crate::runtime::ppoll_and_schedule();
     }
-
     crate::syscall::exit(0);
 }
