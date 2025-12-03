@@ -47,8 +47,8 @@ class AsyncServer:
         print(f"    Starting server: workers={self.workers}, port={self.port}")
         self.process = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             preexec_fn=os.setsid
         )
         
@@ -85,36 +85,7 @@ class AsyncServer:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.stop()
 
-    def wait_for_log(self, needle, timeout=3.0):
-        """Wait up to `timeout` seconds for `needle` to appear in server stdout.
-
-        Returns True if found, False on timeout or if stdout isn't available.
-        """
-        if not self.process or not self.process.stdout:
-            return False
-        end = time.time() + timeout
-        buf = b""
-        fd = self.process.stdout.fileno()
-        while time.time() < end:
-            r, _, _ = select.select([fd], [], [], 0.1)
-            if r:
-                try:
-                    chunk = os.read(fd, 4096)
-                except Exception:
-                    time.sleep(0.05)
-                    continue
-                if not chunk:
-                    break
-                buf += chunk
-                try:
-                    s = buf.decode('utf-8', errors='ignore')
-                except Exception:
-                    s = str(buf)
-                if needle in s:
-                    return True
-            else:
-                time.sleep(0.05)
-        return False
+    # (stdout capture / wait_for_log removed)
 
 def http_get(port, path="/", timeout=3):
     """Perform HTTP GET request"""
@@ -198,30 +169,35 @@ def test_websocket_echo(port, server=None):
     try:
         ws = websocket.create_connection(f"ws://127.0.0.1:{port}/term", timeout=3)
         
-        # Read welcome message
+        # Read welcome message (binary data)
         welcome = ws.recv()
-        if welcome and "Async NoStd" in welcome:
+        # Convert bytes to string if needed
+        if isinstance(welcome, bytes):
+            welcome_str = welcome.decode('utf-8', errors='ignore')
+        else:
+            welcome_str = welcome
+        if welcome_str and "Async NoStd" in welcome_str:
             print(f"        Welcome message received ({len(welcome)} bytes)")
-        # If the test harness provided the server handle, verify the
-        # server emitted the '[ws connected]' notification.
-        if server is not None:
-            ok = server.wait_for_log("[ws connected]", timeout=2.0)
-            if ok:
-                print("        Server reported websocket connected")
-            else:
-                print_error("        Server did not report '[ws connected]' in time")
+        # No server-side debug log check in production test runs.
         
-        # Test echo
+        # Test echo - send as text, receive as binary
         test_msg = "Hello WebSocket!"
         ws.send(test_msg)
         response = ws.recv()
+        
+        # Convert response to string if it's bytes
+        if isinstance(response, bytes):
+            response_str = response.decode('utf-8', errors='ignore')
+        else:
+            response_str = response
+            
         ws.close()
         
-        if test_msg in response:
+        if test_msg in response_str:
             print(f"        Echo test passed")
             return True, 1
         else:
-            print(f"        Echo failed: sent '{test_msg}', got '{response}'")
+            print(f"        Echo failed: sent '{test_msg}', got '{response_str}'")
             return False, 0
     except Exception as e:
         print(f"        WebSocket test failed: {e}")
@@ -436,7 +412,7 @@ def main():
     print(f"Failed: {Colors.RED}{total_tests - total_passed}{Colors.RESET}")
     print(f"Success rate: {success_rate:.1f}%")
     
-    if success_rate >= 70:
+    if success_rate >= 90:
         print(f"{Colors.GREEN}{'='*60}")
         print(f"  ✓ TESTS PASSED!")
         print(f"  - Single-threaded async runtime: WORKING")

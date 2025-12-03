@@ -175,6 +175,16 @@ pub fn write_usize(fd: i32, n: usize) {
     let _ = write(fd, &buf[..len]);
 }
 
+/// Write a signed 64-bit integer as decimal ASCII to `fd`.
+pub fn write_isize(fd: i32, mut n: i64) {
+    if n < 0 {
+        let _ = write(fd, b"-");
+        n = -n;
+    }
+    let (buf, len) = format_usize(n as usize);
+    let _ = write(fd, &buf[..len]);
+}
+
 #[repr(C)]
 pub struct PollFd {
     pub fd: i32,
@@ -324,7 +334,16 @@ pub fn rt_sigaction(signum: i32, act: *const u8, oldact: *mut u8, sigsetsize: us
 }
 
 pub fn nanosleep(seconds: u64) -> isize {
+    // Legacy wrapper (seconds). Keep for compatibility but prefer nanosleep_ns.
     let ts = [seconds, 0u64];
+    unsafe { syscall2(35, &ts as *const u64 as u64, 0) as isize }
+}
+
+/// Sleep for the given duration in nanoseconds using `nanosleep` syscall.
+pub fn nanosleep_ns(nanos: u64) -> isize {
+    let sec = nanos / 1_000_000_000;
+    let nsec = (nanos % 1_000_000_000) as u64;
+    let ts = [sec, nsec];
     unsafe { syscall2(35, &ts as *const u64 as u64, 0) as isize }
 }
 

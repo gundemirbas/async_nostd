@@ -152,8 +152,9 @@ fn find_header_val<'a>(req: &'a [u8], name: &str) -> Option<&'a [u8]> {
 }
 
 async fn send_ws_payload(fd: i32, payload: &[u8]) {
+    // Build a single unmasked text frame (server -> client)
     let mut out = Vec::new();
-    out.push(0x80 | 0x1); // FIN + text opcode
+    out.push(0x80 | 0x2); // FIN + binary opcode (client expects ArrayBuffer)
     let l = payload.len();
     if l < 126 {
         out.push(l as u8);
@@ -168,7 +169,22 @@ async fn send_ws_payload(fd: i32, payload: &[u8]) {
         }
     }
     out.extend_from_slice(payload);
-    let _ = SendFuture::new(fd, &out).await;
+
+    // Ensure we send the entire frame, handling partial writes
+    let mut off = 0usize;
+    while off < out.len() {
+        let slice = &out[off..];
+        let r = SendFuture::new(fd, slice).await;
+        if r < 0 {
+            break;
+        }
+        let wrote = r as usize;
+        off += wrote;
+        if wrote == 0 {
+            // avoid spin in case of unexpected 0
+            break;
+        }
+    }
 }
 
 pub async fn accept_and_run(fd: i32, request: &[u8]) {
@@ -192,20 +208,38 @@ pub async fn accept_and_run(fd: i32, request: &[u8]) {
         resp.extend_from_slice(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ");
         resp.extend_from_slice(accept.as_bytes());
         resp.extend_from_slice(b"\r\n\r\n");
-        // Attempt to write the handshake synchronously via syscall to
-        // get the response to the client as soon as possible. If the
-        // socket is non-blocking the syscall may return EAGAIN or only
-        // write a partial amount — in that case fall back to the async
-        // `SendFuture` to reliably finish sending the remaining bytes.
-        let mut sent = sys::sendto(fd, resp.as_ptr(), resp.len(), 0, core::ptr::null(), 0);
-        if sent < 0 {
-            // syscall failed (could be EAGAIN or other). Use async send.
-            let _ = SendFuture::new(fd, &resp).await;
-        } else if (sent as usize) < resp.len() {
-            // partial write — send remaining bytes asynchronously
-            let off = sent as usize;
-            let _ = SendFuture::new(fd, &resp[off..]).await;
+        // Log the request line (first CRLF) to aid debugging
+        // (debug logging removed)
+
+        // To ensure the browser receives the HTTP 101 immediately and
+        // doesn't stay in CONNECTING, temporarily clear O_NONBLOCK on the
+        // accepted socket and perform a blocking write loop for the
+        // handshake response. After the handshake we restore
+        // non-blocking mode and continue with async I/O for frames.
+        let _ = sys::fcntl(fd, sys::F_SETFL, 0); // clear O_NONBLOCK
+        let mut off_sync = 0usize;
+        while off_sync < resp.len() {
+            let ptr = unsafe { resp.as_ptr().add(off_sync) };
+            let rem = resp.len() - off_sync;
+            let r = sys::sendto(fd, ptr, rem, 0, core::ptr::null(), 0);
+            if r < 0 {
+                // Something went wrong with the blocking send; fall back
+                // to async send for the remainder.
+                let _ = sys::fcntl(fd, sys::F_SETFL, sys::O_NONBLOCK);
+                let _ = SendFuture::new(fd, &resp[off_sync..]).await;
+                break;
+            }
+            let wrote = r as usize;
+            if wrote == 0 {
+                // Unexpected zero — break to avoid spinning and use async
+                let _ = sys::fcntl(fd, sys::F_SETFL, sys::O_NONBLOCK);
+                let _ = SendFuture::new(fd, &resp[off_sync..]).await;
+                break;
+            }
+            off_sync += wrote;
         }
+        // Restore non-blocking mode for normal async operation
+        let _ = sys::fcntl(fd, sys::F_SETFL, sys::O_NONBLOCK);
 
         // Send welcome message after successful handshake synchronously
         let welcome = b"\r\n\x1b[1;32m=== Async NoStd Terminal ===\x1b[0m\r\n\r\n\x1b[1;36mWelcome to the no_std async runtime!\x1b[0m\r\n\r\nFeatures:\r\n  \x1b[33m*\x1b[0m Lock-free task scheduler (Treiber stack)\r\n  \x1b[33m*\x1b[0m Multi-threaded workers with TLS\r\n  \x1b[33m*\x1b[0m ppoll-based async I/O\r\n  \x1b[33m*\x1b[0m 31KB binary (stripped)\r\n\r\n\x1b[90mType anything and it will be echoed back...\x1b[0m\r\n\r\n$ ";
@@ -215,40 +249,8 @@ pub async fn accept_and_run(fd: i32, request: &[u8]) {
         // Prefer a detailed line with remote IP:port so tests and logs can
         // attribute the connection. Fall back to a simple marker if
         // peer lookup fails.
-        let mut addr_buf: [u8; 16] = [0u8; 16];
-        let mut addr_len: usize = core::mem::size_of::<[u8; 16]>();
-        if sys::getpeername(fd, addr_buf.as_mut_ptr(), &mut addr_len as *mut usize) >= 0 {
-            // Parse sockaddr_in layout: sin_family(u16), sin_port(u16), sin_addr(u32), sin_zero[8]
-            let sin_port_be = u16::from_be_bytes([addr_buf[2], addr_buf[3]]);
-            let sin_addr_be = u32::from_be_bytes([addr_buf[4], addr_buf[5], addr_buf[6], addr_buf[7]]);
-            let ip_a = ((sin_addr_be >> 24) & 0xff) as usize;
-            let ip_b = ((sin_addr_be >> 16) & 0xff) as usize;
-            let ip_c = ((sin_addr_be >> 8) & 0xff) as usize;
-            let ip_d = (sin_addr_be & 0xff) as usize;
-            let port = sys::ntohs(sin_port_be) as usize;
 
-            // Build message: [ws connected] ip=a.b.c.d port=NNNN\n
-            let mut out: Vec<u8> = Vec::new();
-            out.extend_from_slice(b"[ws connected] ip=");
-            let (b1, l1) = sys::format_usize(ip_a);
-            out.extend_from_slice(&b1[..l1]);
-            out.push(b'.');
-            let (b2, l2) = sys::format_usize(ip_b);
-            out.extend_from_slice(&b2[..l2]);
-            out.push(b'.');
-            let (b3, l3) = sys::format_usize(ip_c);
-            out.extend_from_slice(&b3[..l3]);
-            out.push(b'.');
-            let (b4, l4) = sys::format_usize(ip_d);
-            out.extend_from_slice(&b4[..l4]);
-            out.extend_from_slice(b" port=");
-            let (bp, lp) = sys::format_usize(port);
-            out.extend_from_slice(&bp[..lp]);
-            out.push(b'\n');
-            let _ = sys::write(1, &out);
-        } else {
-            let _ = sys::write(1, b"[ws connected]\n");
-        }
+            // (no connection stdout logging in production)
 
         // enter buffered frame loop: accumulate recv bytes and parse frames incrementally.
         let mut buf_acc: Vec<u8> = Vec::new();
@@ -335,10 +337,7 @@ pub async fn accept_and_run(fd: i32, request: &[u8]) {
                         let full = core::mem::take(&mut frag_payload);
                         // echo as text/binary based on op
                         if op == 0x1 || op == 0x2 {
-                            // Log to server console then echo back
-                            let _ = sys::write(1, b"[ws recv] ");
-                            let _ = sys::write(1, &full);
-                            let _ = sys::write(1, b"\n");
+                            // echo back
                             send_ws_payload(fd, &full).await;
                         }
                     }
@@ -347,10 +346,7 @@ pub async fn accept_and_run(fd: i32, request: &[u8]) {
 
                 if opcode == 0x1 || opcode == 0x2 {
                     if fin {
-                        // single-frame message — log and echo
-                        let _ = sys::write(1, b"[ws recv] ");
-                        let _ = sys::write(1, &payload);
-                        let _ = sys::write(1, b"\n");
+                        // single-frame message — echo
                         send_ws_payload(fd, &payload).await;
                     } else {
                         // start fragmentation

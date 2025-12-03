@@ -1,18 +1,25 @@
 # Async NoStd Project - AI Agent Instructions
 
 ## Project Overview
-**Workspace-based** freestanding Rust binary (`#![no_std]`, `#![no_main]`) with async/await via bare-metal Linux syscalls on x86_64. **Edition 2024** with workspace crate architecture (906 LOC, 15KB stripped binary).
+**Workspace-based** freestanding Rust binary (`#![no_std]`, `#![no_main]`) with async/await via bare-metal Linux syscalls on x86_64. **Edition 2024** with workspace crate architecture (~2350 LOC, 32KB stripped binary). Production-ready HTTP + WebSocket server with multi-threaded async runtime.
 
 ## Architecture - Workspace Structure
 
 ```
-Cargo.toml                  → Workspace root + binary target
-src/main.rs (157 lines)     → Demo application (minimal, uses subcrates)
+Cargo.toml                       → Workspace root + binary target
+src/main.rs (138 lines)          → Demo app: socket setup + acceptor thread spawning
 crates/
-  ├─ syscall/ (209 lines)   → Generic syscall wrappers (syscall1-6 pattern)
-  ├─ runtime/ (328 lines)   → Entry point, allocator, task scheduler, IO registry
-  ├─ executor/ (59 lines)   → Worker-based task executor
-  └─ net/ (153 lines)       → Network futures (Accept/Connect/Send/Recv)
+  ├─ syscall/ (399 lines)        → Generic syscall wrappers (syscall1-6 pattern)
+  ├─ runtime/ (712 lines)        → Entry point, allocator, scheduler, IO registry, acceptor wrapper
+  │   ├─ lib.rs                  → Main module + acceptor thread helpers
+  │   ├─ allocator.rs            → 16MB bump allocator
+  │   ├─ scheduler.rs            → Lock-free Treiber stack task scheduler
+  │   └─ io_registry.rs          → FD waker registration + eventfd signaling
+  ├─ executor/ (76 lines)        → Worker thread pool coordinator
+  ├─ net/ (185 lines)            → Network futures (Accept/Connect/Send/Recv)
+  ├─ http/ (85 lines)            → HTTP request parser + response builder
+  ├─ websocket/ (397 lines)      → WS handshake (SHA1+base64) + frame echo server
+  └─ pty/ (13 lines)             → PTY stub (not implemented)
 ```
 
 **Dependency Graph**: `syscall` → `runtime` → `executor`/`net` → `main`
@@ -24,46 +31,71 @@ crates/
 **async-syscall** (`crates/syscall/lib.rs`)
 - Generic syscall helpers: `syscall1()` through `syscall6()` with inline asm
 - Safe wrappers: `write()`, `exit()`, `mmap()`, `socket()`, `bind()`, `listen()`, etc.
-- `spawn_thread()`: Clone-based (CLONE_VM|FS|FILES|SIGHAND|SIGCHLD, NOT CLONE_THREAD)
+- `spawn_thread()`: Clone-based with CLONE_VM|FS|FILES|SIGHAND|THREAD|SETTLS (real threads + TLS)
+- Byte-order helpers: `htons()`, `ntohs()` for network conversions
 - No dependencies, pure syscall layer
 
-**async-runtime** (`crates/runtime/lib.rs`)
+**async-runtime** (`crates/runtime/lib.rs` + submodules)
 - `_start()`: Naked entry point with 16-byte stack alignment, calls `main_trampoline()`
-- Bump allocator: 16MB mmap-backed heap, no deallocation (permanent allocations)
-- Task scheduler: Lock-free Treiber stack for ready tasks, handle-based waker system
-- IO registry: `spin::Mutex<Vec<IoEntry>>` for fd → waker mappings, `ppoll()`-based readiness
-- Utilities: `read_ptr_array()`, `parse_cstring_usize()` for argv parsing
+- **Acceptor thread architecture**: `spawn_acceptor_thread(sfd, callback)` - spawns dedicated blocking thread that accepts connections and invokes callback per fd (eliminates accept/ppoll races)
+- `AcceptorThreadArg`: C-compatible struct for passing sfd + callback to acceptor
+- `acceptor_thread_wrapper()`: C-compatible entry point for clone syscall
+- `run_acceptor_loop()`: Pure Rust blocking accept loop (sets socket blocking, calls accept4, sets accepted fd non-blocking, invokes callback)
+- Bump allocator (`allocator.rs`): 16MB mmap-backed heap, CAS-based concurrent allocation, no deallocation
+- Task scheduler (`scheduler.rs`): Lock-free Treiber stack for ready tasks, handle-based waker system, 1024 task slots with generation counters
+- IO registry (`io_registry.rs`): `spin::Mutex<Vec<IoEntry>>` for fd → waker mappings, `ppoll()`-based readiness, eventfd signaling
+- Utilities: `read_ptr_array()`, `parse_cstring_usize()`, `parse_cstring_ip()` for argv parsing
 - **Depends on**: `async-syscall`, `spin`
 
 **async-executor** (`crates/executor/lib.rs`)
 - `Executor::enqueue_task()`: Registers task via `runtime::register_task()`
-- `Executor::start_workers()`: Spawns worker threads (64KB stack each)
-- `worker_trampoline()`: Polls scheduled tasks, calls `runtime::ppoll_and_schedule()` when idle
+- `Executor::start_workers()`: Spawns N worker threads (64KB stack each) then becomes a worker itself
+- `worker_loop()`: Polls scheduled tasks via `take_scheduled_task()` + `poll_task_safe()`, calls `ppoll_and_schedule()` when idle
 - `TASKS_REMAINING`: Global atomic counter for completion tracking
 - **Depends on**: `async-syscall`, `async-runtime`
 
 **async-net** (`crates/net/lib.rs`)
 - Futures: `AcceptFuture`, `ConnectFuture`, `RecvFuture`, `SendFuture`
 - Polls syscalls, returns `Poll::Pending` on EAGAIN (-11), registers fd waker via `runtime::register_fd_waker()`
+- **Note**: `AcceptFuture` exists but production uses acceptor thread instead to avoid races
+
+**async-http** (`crates/http/lib.rs`)
+- `handle_http_connection(fd)`: Async handler for HTTP/WebSocket routing
+- Routes: `GET /` → serves embedded `html/index.html`, `GET /term` or `/ws` → WebSocket upgrade
+- `http_response_headers()`: Builds HTTP response with status, content-type, content-length
+- **Depends on**: `async-syscall`, `async-runtime`, `async-net`, `async-websocket`
+
+**async-websocket** (`crates/websocket/lib.rs`)
+- `accept_and_run(fd, request)`: WebSocket handshake + echo server
+- Handshake: SHA-1 hash + base64 encoding of Sec-WebSocket-Key + GUID
+- **Critical**: Temporarily sets socket blocking for handshake send (eliminates browser CONNECTING state bug), restores non-blocking for frame loop
+- Frame parsing: Handles fragmentation, masking, ping/pong (0x9/0xA), close (0x8), text/binary (0x1/0x2)
+- Sends frames as binary opcode (0x2) since client uses ArrayBuffer
+- **Depends on**: `async-syscall`, `async-runtime`, `async-net`
 ## Build System
 
 ### Workspace Configuration
-- **Workspace**: 4 member crates under `crates/`, main binary at root
+- **Workspace**: 7 member crates under `crates/`, main binary at root
 - **Target**: `x86_64-unknown-none` (standard tier 2, NO custom JSON needed)
 - **Build-std**: `.cargo/config.toml` auto-enables for all builds
 - **Rustflags**: `-C relocation-model=static -C code-model=large` (in config.toml)
-- **Binary**: 15KB stripped, statically linked ELF, NOT PIE
+- **Binary**: 32KB stripped, statically linked ELF, NOT PIE
 
 ### Build & Run
 ```bash
 # Build (nightly required for build-std)
 cargo +nightly build --release
 
-# Run with custom worker count
-./target/x86_64-unknown-none/release/async-nostd 8
+# Run server (accepts: worker_count, listen_ip, listen_port)
+./target/x86_64-unknown-none/release/async-nostd 8              # 8 workers
+./target/x86_64-unknown-none/release/async-nostd 4 127.0.0.1 8080  # custom port
+./target/x86_64-unknown-none/release/async-nostd 0              # single-threaded mode
 
-# Default: 4 workers
-./target/x86_64-unknown-none/release/async-nostd
+# Test suite (requires websocket-client: pip install websocket-client)
+python3 test_all.py        # Runs all tests (single + multi-threaded)
+python3 test_all.py single # Single-threaded tests only
+python3 test_all.py multi  # Multi-threaded tests only
+python3 test_all.py ws     # WebSocket tests only
 ```
 
 ### Profile Settings
@@ -72,6 +104,7 @@ cargo +nightly build --release
 opt-level = "z"      # Size optimization
 lto = true           # Link-time optimization
 codegen-units = 1    # Single codegen for better optimization
+strip = "symbols"    # Strip symbols for smaller binary
 ## Hard Rules for AI Agents
 
 ### Unsafe Code Placement
@@ -80,6 +113,14 @@ codegen-units = 1    # Single codegen for better optimization
 3. All inline `asm!` blocks go in `crates/syscall/lib.rs` (private `syscallN` helpers)
 4. Waker/task polling unsafe code in `crates/runtime/lib.rs` (`poll_task()`, `create_waker_for_handle()`)
 5. When adding syscalls: Use generic `syscall1-6` helpers, expose safe typed wrapper
+
+### Modularization Pattern (Acceptor Thread Example)
+The acceptor thread demonstrates proper code organization:
+- **Rust logic**: `run_acceptor_loop(sfd, callback)` - pure Rust, easy to test
+- **C wrapper**: `acceptor_thread_wrapper(arg: *mut u8)` - minimal unsafe bridging code for clone syscall
+- **Public API**: `spawn_acceptor_thread(sfd, callback)` - safe interface that hides implementation
+- **Main usage**: Single line: `async_runtime::spawn_acceptor_thread(sfd, handle_accepted_connection)`
+This pattern eliminated 158 lines of duplicated code from main.rs (53% reduction)
 ### Common Patterns
 
 **Adding a new syscall:**
@@ -91,16 +132,23 @@ pub fn getpid() -> i32 {
 }
 ```
 
-**Using subcrates in main:**
+**Using helper functions to reduce duplication:**
 ```rust
-use async_syscall as sys;
-use async_executor::Executor;
-use async_net::{AcceptFuture, SockAddrIn, AF_INET, SOCK_STREAM};
-
-fn main() {
+// Extract repeated setup into helpers (see src/main.rs)
+fn create_listening_socket(ip: u32, port: usize) -> Result<i32, ()> {
     let sfd = sys::socket(AF_INET, SOCK_STREAM, 0);
-    let cfd = AcceptFuture::new(sfd).await;  // Async accept
+    // ... bind, listen, error handling ...
+    Ok(sfd)
 }
+
+fn print_socket_info(sfd: i32) {
+    // ... getsockname, format output ...
+}
+
+// Main becomes concise
+let sfd = create_listening_socket(listen_ip, listen_port)?;
+print_socket_info(sfd);
+async_runtime::spawn_acceptor_thread(sfd, handle_accepted_connection);
 ```
 
 **Spawning async tasks:**
@@ -123,10 +171,11 @@ write(b"Hello\n");  // Safe wrapper over syscall 1 (write)
 - Futures in `async-net` crate use this pattern (see `AcceptFuture::poll()`)
 
 ### Thread Model
-- `spawn_thread()` uses `clone` with flags: CLONE_VM|FS|FILES|SIGHAND|SIGCHLD (17)
-- **NOT CLONE_THREAD**: No pthread TLS, workers are process-like with shared VM
-- Each worker: 64KB mmap stack, runs until `TASKS_REMAINING == 0`, then `exit(0)`
-- Workers alternate: poll scheduled tasks → `ppoll_and_schedule()` if idle
+- `spawn_thread()` uses `clone` with flags: CLONE_VM|FS|FILES|SIGHAND|THREAD|SETTLS
+- **Real threads with TLS**: CLONE_THREAD for shared PID, CLONE_SETTLS for thread-local storage
+- Each worker: 64KB mmap stack + 4KB TLS block with self-pointer (x86_64 TLS ABI)
+- Workers run forever in `worker_loop()`, polling scheduled tasks → `ppoll_and_schedule()` when idle
+- **Acceptor thread**: Separate blocking thread that calls `accept4()` in loop, schedules per-connection tasks directly via `register_task()` + `wake_handle()` (avoids accept/ppoll races)
 
 ### Memory Model  
 - Bump allocator: 16MB mmap heap, CAS-based concurrent allocation

@@ -44,11 +44,22 @@ pub fn http_response_headers(status: &str, content_type: &str, content_len: usiz
 }
 
 pub async fn handle_http_connection(fd: i32) {
+    // Minimal diagnostic: log that we started handling this fd.
+    let _ = sys::write(1, b"[http] handle fd: ");
+    sys::write_usize(1, fd as usize);
+    let _ = sys::write(1, b"\n");
     // read a small request (accumulate only first packet)
     let buf = RecvFuture::new(fd, 1024).await;
     if buf.is_empty() {
         let _ = sys::close(fd);
         return;
+    }
+    // Log the request line (first CRLF) for diagnostics
+    if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
+        let line = &buf[..pos];
+        let _ = sys::write(1, b"[http] req: ");
+        let _ = sys::write(1, line);
+        let _ = sys::write(1, b"\n");
     }
     // parse very simply
     if buf.starts_with(b"GET / ") || buf.starts_with(b"GET /HTTP") || buf.starts_with(b"GET / HTTP")

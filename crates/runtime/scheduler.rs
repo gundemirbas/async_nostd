@@ -3,6 +3,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::future::Future;
+use async_syscall as sys;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
@@ -127,8 +128,9 @@ pub fn wake_handle(handle: usize) {
             .compare_exchange(head, node, Ordering::Release, Ordering::Acquire)
             .is_ok()
         {
-            crate::io_registry::signal_eventfd();
-            return;
+                // Wake the eventfd to notify pollers that work is available.
+                crate::io_registry::signal_eventfd();
+                return;
         }
     }
 }
@@ -145,13 +147,49 @@ pub fn take_scheduled_task() -> Option<usize> {
             .is_ok()
         {
             let handle = unsafe { (*head).handle };
+            // taken handle
             free_node(head);
             return Some(handle);
         }
     }
 }
 
+/// Check whether a handle is currently present in the scheduled Treiber stack.
+pub fn is_handle_scheduled(target: usize) -> bool {
+    let mut cur = SCHEDULE_HEAD.load(Ordering::Acquire);
+    let mut seen = false;
+    let mut steps = 0;
+    while !cur.is_null() && steps < 4096 {
+        unsafe {
+            if (*cur).handle == target {
+                seen = true;
+                break;
+            }
+            cur = (*cur).next;
+        }
+        steps += 1;
+    }
+    seen
+}
+
+/// Dump up to `limit` handles from the scheduled stack (for diagnostics).
+pub fn dump_scheduled(limit: usize) {
+    let mut cur = SCHEDULE_HEAD.load(Ordering::Acquire);
+    let mut i = 0;
+    while !cur.is_null() && i < limit {
+        unsafe {
+            let h = (*cur).handle;
+            let _ = sys::write(1, b"[sched_dump] handle: ");
+            sys::write_usize(1, h);
+            let _ = sys::write(1, b"\n");
+            cur = (*cur).next;
+        }
+        i += 1;
+    }
+}
+
 pub fn poll_task_safe(handle: usize, cx: &mut Context<'_>) -> Poll<()> {
+    // Poll the task associated with `handle`.
     let slot_idx = (handle >> 32) & 0x3FF;
     let generation = handle & 0xFFFFFFFF;
 
@@ -175,6 +213,7 @@ pub fn poll_task_safe(handle: usize, cx: &mut Context<'_>) -> Poll<()> {
             drop(guard);
             FREE_SLOTS.lock().push(slot_idx);
         }
+        // poll result handled by caller
         result
     } else {
         Poll::Ready(())

@@ -8,6 +8,11 @@ use alloc::vec::Vec;
 use async_syscall as syscall;
 use core::sync::atomic::Ordering;
 
+// Global diagnostic sequence counter to trace event ordering across modules
+// No runtime diagnostic sequence in production build.
+
+// (No extra task/pin imports needed here)
+
 mod allocator;
 mod io_registry;
 mod scheduler;
@@ -16,13 +21,65 @@ mod scheduler;
 pub use io_registry::{close_eventfd, register_fd_waker};
 pub use scheduler::{
     create_waker, poll_task_safe, register_task, take_scheduled_task, wake_handle,
+    is_handle_scheduled, dump_scheduled,
 };
+
+// Acceptor thread wrapper and helpers
+#[repr(C)]
+pub struct AcceptorThreadArg {
+    pub sfd: i32,
+    pub callback: extern "C" fn(i32),
+}
+
+/// C-compatible wrapper for acceptor thread.
+/// This is the entry point spawned by clone syscall.
+#[unsafe(no_mangle)]
+pub extern "C" fn acceptor_thread_wrapper(arg: *mut u8) {
+    let ptr = arg as *mut AcceptorThreadArg;
+    let arg_data = unsafe { core::ptr::read(ptr) };
+    unsafe { let _ = alloc::boxed::Box::from_raw(ptr); }
+    
+    run_acceptor_loop(arg_data.sfd, arg_data.callback);
+}
+
+/// The actual acceptor loop logic in Rust.
+/// Accepts connections and calls the callback for each accepted fd.
+fn run_acceptor_loop(sfd: i32, callback: extern "C" fn(i32)) {
+    let _ = syscall::write(1, b"[acceptor] started\n");
+    let _ = syscall::fcntl(sfd, syscall::F_SETFL, 0); // blocking mode
+    
+    loop {
+        let mut sa_buf = [0u8; 32];
+        let mut salen: usize = sa_buf.len();
+        let r = syscall::accept4(sfd, sa_buf.as_mut_ptr(), &mut salen as *mut usize, 0);
+        
+        if r >= 0 {
+            let cfd = r as i32;
+            let _ = syscall::fcntl(cfd, syscall::F_SETFL, syscall::O_NONBLOCK);
+            callback(cfd);
+        } else if r == -11 {
+            // EAGAIN (shouldn't happen for blocking socket)
+            let _ = syscall::nanosleep_ns(1_000_000);
+        } else {
+            // Other errors
+            let _ = syscall::nanosleep_ns(10_000_000);
+        }
+    }
+}
+
+/// Spawn an acceptor thread with the given callback.
+pub fn spawn_acceptor_thread(sfd: i32, callback: extern "C" fn(i32)) {
+    let arg = alloc::boxed::Box::new(AcceptorThreadArg { sfd, callback });
+    let arg_ptr = alloc::boxed::Box::into_raw(arg) as *mut u8;
+    let _ = syscall::spawn_thread(acceptor_thread_wrapper, arg_ptr, 64 * 1024);
+}
 
 // SIGCHLD handler installation
 fn install_sigchld_handler() {
-    // SA_NOCLDWAIT = 0x02 - automatically reap children
-    let sa_handler: u64 = 0;
-    let sa_flags: u64 = 0x02;
+    // Set SIGCHLD to SIG_IGN so the kernel reaps child processes automatically.
+    // SIG_IGN is represented by a non-null handler (1) in the raw sigaction.
+    let sa_handler: u64 = 1; // SIG_IGN
+    let sa_flags: u64 = 0;
     let sa_restorer: u64 = 0;
     let sa_mask = [0u64; 16];
 
@@ -32,12 +89,7 @@ fn install_sigchld_handler() {
     sigaction[2] = sa_restorer;
     sigaction[3..(3 + sa_mask.len())].copy_from_slice(&sa_mask);
 
-    let _ = syscall::rt_sigaction(
-        17,
-        sigaction.as_ptr() as *const u8,
-        core::ptr::null_mut(),
-        8,
-    );
+    let _ = syscall::rt_sigaction(17, sigaction.as_ptr() as *const u8, core::ptr::null_mut(), 8);
 }
 
 pub fn ppoll_and_schedule() {
@@ -73,12 +125,18 @@ pub fn ppoll_and_schedule() {
     }
 
     if fds.is_empty() {
-        syscall::nanosleep(10_000_000);
+        // Sleep 10ms to avoid busy-looping when there are no fds registered
+        let _ = syscall::nanosleep_ns(10_000_000);
         return;
     }
 
     let ret = syscall::ppoll_timeout(fds.as_mut_ptr(), fds.len(), 1000);
+    // Diagnostic: log ppoll return and polled fds
+    // production: no ppoll diagnostic
     if ret <= 0 {
+        // ppoll timed out or was interrupted; sleep briefly to avoid
+        // tight user-space loops calling ppoll repeatedly.
+        let _ = syscall::nanosleep_ns(1_000_000); // 1ms
         return;
     }
 
@@ -91,6 +149,7 @@ pub fn ppoll_and_schedule() {
 
     let start = if evt >= 0 { 1 } else { 0 };
     for pf in fds.iter().skip(start) {
+        // Diagnostic per-fd revents
         if pf.revents != 0 {
             let mut to_wake: Vec<core::task::Waker> = Vec::new();
             {

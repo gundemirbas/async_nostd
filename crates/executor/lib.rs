@@ -58,6 +58,10 @@ extern "C" fn worker_loop(_arg: *mut u8) -> ! {
     // Worker runs forever, polling tasks and handling IO
     loop {
         if let Some(handle) = async_runtime::take_scheduled_task() {
+            // Diagnostic: log worker polling activity
+            let _ = async_syscall::write(1, b"[worker] poll handle: ");
+            async_syscall::write_usize(1, handle);
+            let _ = async_syscall::write(1, b"\n");
             let waker = async_runtime::create_waker(handle);
             let mut cx = Context::from_waker(&waker);
             let result = async_runtime::poll_task_safe(handle, &mut cx);

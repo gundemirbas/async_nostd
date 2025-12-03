@@ -39,6 +39,7 @@ impl core::future::Future for AcceptFuture {
         let mut sa_buf = [0u8; 32];
         let mut salen: usize = sa_buf.len();
         let r = async_syscall::accept4(self.fd, sa_buf.as_mut_ptr(), &mut salen as *mut usize, 0);
+        // accept4 result available
         if r >= 0 {
             return Poll::Ready(r);
         }
