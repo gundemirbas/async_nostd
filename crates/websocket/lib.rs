@@ -211,6 +211,8 @@ pub async fn accept_and_run(fd: i32, request: &[u8]) {
         // Log the request line (first CRLF) to aid debugging
         // (debug logging removed)
 
+
+
         // To ensure the browser receives the HTTP 101 immediately and
         // doesn't stay in CONNECTING, temporarily clear O_NONBLOCK on the
         // accepted socket and perform a blocking write loop for the
@@ -218,20 +220,31 @@ pub async fn accept_and_run(fd: i32, request: &[u8]) {
         // non-blocking mode and continue with async I/O for frames.
         let _ = sys::fcntl(fd, sys::F_SETFL, 0); // clear O_NONBLOCK
         let mut off_sync = 0usize;
+        let mut iteration = 0u32;
         while off_sync < resp.len() {
+            iteration += 1;
+            if iteration > 1000 {
+                // Safety valve: avoid infinite loop, switch to async
+                let _ = sys::fcntl(fd, sys::F_SETFL, sys::O_NONBLOCK);
+                let _ = SendFuture::new(fd, &resp[off_sync..]).await;
+                break;
+            }
             let ptr = unsafe { resp.as_ptr().add(off_sync) };
             let rem = resp.len() - off_sync;
             let r = sys::sendto(fd, ptr, rem, 0, core::ptr::null(), 0);
+            if r == -11 {
+                // EAGAIN in blocking mode shouldn't happen
+                continue;
+            }
             if r < 0 {
-                // Something went wrong with the blocking send; fall back
-                // to async send for the remainder.
+                // Error: fall back to async send
                 let _ = sys::fcntl(fd, sys::F_SETFL, sys::O_NONBLOCK);
                 let _ = SendFuture::new(fd, &resp[off_sync..]).await;
                 break;
             }
             let wrote = r as usize;
             if wrote == 0 {
-                // Unexpected zero — break to avoid spinning and use async
+                // Unexpected zero: switch to async
                 let _ = sys::fcntl(fd, sys::F_SETFL, sys::O_NONBLOCK);
                 let _ = SendFuture::new(fd, &resp[off_sync..]).await;
                 break;
@@ -241,16 +254,16 @@ pub async fn accept_and_run(fd: i32, request: &[u8]) {
         // Restore non-blocking mode for normal async operation
         let _ = sys::fcntl(fd, sys::F_SETFL, sys::O_NONBLOCK);
 
-        // Send welcome message after successful handshake synchronously
-        let welcome = b"\r\n\x1b[1;32m=== Async NoStd Terminal ===\x1b[0m\r\n\r\n\x1b[1;36mWelcome to the no_std async runtime!\x1b[0m\r\n\r\nFeatures:\r\n  \x1b[33m*\x1b[0m Lock-free task scheduler (Treiber stack)\r\n  \x1b[33m*\x1b[0m Multi-threaded workers with TLS\r\n  \x1b[33m*\x1b[0m ppoll-based async I/O\r\n  \x1b[33m*\x1b[0m 31KB binary (stripped)\r\n\r\n\x1b[90mType anything and it will be echoed back...\x1b[0m\r\n\r\n$ ";
-        let _ = send_ws_payload(fd, welcome).await;
-
-        // Notify local console that a websocket connection has been established.
-        // Prefer a detailed line with remote IP:port so tests and logs can
-        // attribute the connection. Fall back to a simple marker if
-        // peer lookup fails.
-
-            // (no connection stdout logging in production)
+        // Send welcome message with ANSI colors
+        let welcome = b"\r\n\x1b[1;32m=== Async NoStd Terminal ===\x1b[0m\r\n\r\n\
+\x1b[1;36mWelcome to the async no_std WebSocket server!\x1b[0m\r\n\r\n\
+Features:\r\n\
+  \x1b[32m*\x1b[0m Lock-free task scheduler\r\n\
+  \x1b[32m*\x1b[0m Multi-threaded async runtime\r\n\
+  \x1b[32m*\x1b[0m WebSocket echo server\r\n\
+  \x1b[32m*\x1b[0m 32KB binary size\r\n\r\n\
+Type anything to see it echoed back!\r\n\r\n";
+        send_ws_payload(fd, welcome).await;
 
         // enter buffered frame loop: accumulate recv bytes and parse frames incrementally.
         let mut buf_acc: Vec<u8> = Vec::new();
@@ -393,5 +406,8 @@ pub async fn accept_and_run(fd: i32, request: &[u8]) {
                 // need more data; continue recv
             }
         }
+    } else {
+        // Sec-WebSocket-Key not found - invalid WebSocket handshake
+        let _ = sys::close(fd);
     }
 }

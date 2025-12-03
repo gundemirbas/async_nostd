@@ -56,17 +56,27 @@ impl Executor {
 
 extern "C" fn worker_loop(_arg: *mut u8) -> ! {
     // Worker runs forever, polling tasks and handling IO
+    let mut poll_count = 0u64;
     loop {
         if let Some(handle) = async_runtime::take_scheduled_task() {
-            // Diagnostic: log worker polling activity
-            let _ = async_syscall::write(1, b"[worker] poll handle: ");
-            async_syscall::write_usize(1, handle);
-            let _ = async_syscall::write(1, b"\n");
+            poll_count += 1;
+            if poll_count % 10000 == 0 {
+                let _ = async_syscall::write(1, b"[worker] Polled ");
+                async_syscall::write_usize(1, poll_count as usize);
+                let _ = async_syscall::write(1, b" tasks\n");
+            }
             let waker = async_runtime::create_waker(handle);
             let mut cx = Context::from_waker(&waker);
+            
             let result = async_runtime::poll_task_safe(handle, &mut cx);
-            if matches!(result, Poll::Ready(_)) {
-                TASKS_REMAINING.fetch_sub(1, Ordering::Relaxed);
+            match result {
+                Poll::Ready(_) => {
+                    TASKS_REMAINING.fetch_sub(1, Ordering::Relaxed);
+                }
+                Poll::Pending => {
+                    // Task is waiting for IO, waker is registered.
+                    // Do NOT re-schedule here; ppoll will wake it when ready.
+                }
             }
             continue;
         }

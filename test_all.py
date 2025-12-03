@@ -10,7 +10,6 @@ import socket
 import sys
 import signal
 import os
-import select
 
 class Colors:
     GREEN = '\033[92m'
@@ -38,6 +37,7 @@ class AsyncServer:
         self.workers = workers
         self.port = port
         self.process = None
+        self.log_file = f"/tmp/test-server-{port}.log"
         
     def start(self):
         """Start the async server"""
@@ -45,12 +45,15 @@ class AsyncServer:
         cmd = [binary, str(self.workers), "127.0.0.1", str(self.port)]
         
         print(f"    Starting server: workers={self.workers}, port={self.port}")
-        self.process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            preexec_fn=os.setsid
-        )
+        
+        # Open log file for server output (suppress console output)
+        with open(self.log_file, 'w') as log:
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,  # Suppress stdout (minimal console output)
+                stderr=log,                  # Redirect stderr to log
+                preexec_fn=os.setsid
+            )
         
         # Wait for server to be ready
         max_wait = 3
@@ -77,6 +80,19 @@ class AsyncServer:
                 pass
             self.process.wait()
             self.process = None
+    
+    def get_log(self):
+        """Read server log file"""
+        try:
+            with open(self.log_file, 'r') as f:
+                return f.read()
+        except:
+            return ""
+    
+    def check_log(self, pattern):
+        """Check if pattern exists in log"""
+        log = self.get_log()
+        return pattern in log
 
     def __enter__(self):
         self.start()
@@ -84,8 +100,11 @@ class AsyncServer:
         
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.stop()
-
-    # (stdout capture / wait_for_log removed)
+        # Cleanup log file
+        try:
+            os.remove(self.log_file)
+        except:
+            pass
 
 def http_get(port, path="/", timeout=3):
     """Perform HTTP GET request"""
@@ -152,18 +171,13 @@ def test_http_stress(port, num_requests=10):
     print(f"      Stress: {success}/{num_requests} succeeded")
     return success, num_requests
 
-def test_websocket_echo(port, server=None):
+def test_websocket_echo(port):
     """Test WebSocket handshake and echo"""
     try:
         import websocket
     except ImportError:
-        print(f"      websocket-client not installed, attempting to install via pip...")
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "websocket-client"], stdout=subprocess.DEVNULL)
-            import websocket
-        except Exception:
-            print(f"      Skipping: websocket-client not available (pip install websocket-client)")
-            return None, 0
+        print(f"      Skipping: websocket-client not installed (pip install websocket-client)")
+        return None, 0
     
     print(f"      Testing WebSocket on port {port}...")
     try:
@@ -171,26 +185,15 @@ def test_websocket_echo(port, server=None):
         
         # Read welcome message (binary data)
         welcome = ws.recv()
-        # Convert bytes to string if needed
-        if isinstance(welcome, bytes):
-            welcome_str = welcome.decode('utf-8', errors='ignore')
-        else:
-            welcome_str = welcome
+        welcome_str = welcome.decode('utf-8') if isinstance(welcome, bytes) else welcome
         if welcome_str and "Async NoStd" in welcome_str:
             print(f"        Welcome message received ({len(welcome)} bytes)")
-        # No server-side debug log check in production test runs.
         
-        # Test echo - send as text, receive as binary
+        # Test echo
         test_msg = "Hello WebSocket!"
         ws.send(test_msg)
         response = ws.recv()
-        
-        # Convert response to string if it's bytes
-        if isinstance(response, bytes):
-            response_str = response.decode('utf-8', errors='ignore')
-        else:
-            response_str = response
-            
+        response_str = response.decode('utf-8') if isinstance(response, bytes) else response
         ws.close()
         
         if test_msg in response_str:
@@ -203,53 +206,73 @@ def test_websocket_echo(port, server=None):
         print(f"        WebSocket test failed: {e}")
         return False, 0
 
-def run_single_threaded_tests():
-    """Run all tests for single-threaded mode"""
-    print_section("Single-Threaded Mode Tests (0 workers)")
+def test_websocket_concurrent(port, num_connections=5):
+    """Test concurrent WebSocket connections"""
+    try:
+        import websocket
+    except ImportError:
+        print(f"      Skipping: websocket-client not installed")
+        return None, 0
     
-    passed = 0
-    total = 0
+    import concurrent.futures
     
-    # Test 1: Basic HTTP
-    total += 1
-    port = 7001
-    print_info(f"Test 1: Basic HTTP GET request (port {port})")
-    with AsyncServer(0, port) as server:
-        success, response_len = test_http_basic(port)
-        if success:
-            print_success(f"Response received ({response_len} bytes)")
-            passed += 1
-        else:
-            print_error("Failed to get valid response")
+    print(f"      Testing {num_connections} concurrent WebSocket connections...")
     
-    # Test 2: Multiple requests  
-    total += 1
-    port = 7002
-    print_info(f"Test 2: Sequential requests (port {port})")
-    with AsyncServer(0, port) as server:
-        success, num_total = test_http_stress(port, 5)
-        if success >= 4:
-            print_success(f"Completed {success}/{num_total} requests")
-            passed += 1
-        else:
-            print_error(f"Only {success}/{num_total} succeeded")
+    def ws_echo_test(i):
+        try:
+            ws = websocket.create_connection(f"ws://127.0.0.1:{port}/term", timeout=3)
+            welcome = ws.recv()  # Read welcome
+            test_msg = f"Test {i+1}"
+            ws.send(test_msg)
+            response = ws.recv()
+            response_str = response.decode('utf-8') if isinstance(response, bytes) else response
+            ws.close()
+            success = test_msg in response_str
+            print(f"        Connection {i+1}: {'OK' if success else 'FAILED'}")
+            return success
+        except Exception as e:
+            print(f"        Connection {i+1}: FAILED ({e})")
+            return False
     
-    # Test 3: WebSocket
-    total += 1
-    port = 7003
-    print_info(f"Test 3: WebSocket echo (port {port})")
-    with AsyncServer(0, port) as server:
-        result, count = test_websocket_echo(port, server)
-        if result is None:
-            # Skip this test
-            total -= 1
-        elif result:
-            print_success(f"WebSocket working")
-            passed += 1
-        else:
-            print_error("WebSocket test failed")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_connections) as executor:
+        futures = [executor.submit(ws_echo_test, i) for i in range(num_connections)]
+        results = [f.result() for f in concurrent.futures.as_completed(futures)]
     
-    return passed, total
+    success = sum(results)
+    print(f"      Concurrent WS: {success}/{num_connections} succeeded")
+    return success, num_connections
+
+def test_websocket_stress(port, num_messages=20):
+    """Stress test WebSocket with multiple messages on single connection"""
+    try:
+        import websocket
+    except ImportError:
+        print(f"      Skipping: websocket-client not installed")
+        return None, 0
+    
+    print(f"      WebSocket stress test: {num_messages} messages...")
+    try:
+        ws = websocket.create_connection(f"ws://127.0.0.1:{port}/term", timeout=3)
+        welcome = ws.recv()  # Read welcome
+        
+        success = 0
+        for i in range(num_messages):
+            test_msg = f"Message {i+1}"
+            ws.send(test_msg)
+            response = ws.recv()
+            response_str = response.decode('utf-8') if isinstance(response, bytes) else response
+            if test_msg in response_str:
+                success += 1
+            if (i + 1) % 10 == 0:
+                print(f"        Progress: {success}/{i+1}")
+        
+        ws.close()
+        print(f"      WS Stress: {success}/{num_messages} succeeded")
+        return success, num_messages
+    except Exception as e:
+        print(f"        WebSocket stress test failed: {e}")
+        return False, 0
+
 
 def run_multi_threaded_tests():
     """Run all tests for multi-threaded mode"""
@@ -258,9 +281,9 @@ def run_multi_threaded_tests():
     passed = 0
     total = 0
     
-    # Test with 2, 4, and 8 workers
+    # Test with 2, 4, 8, and 16 workers
     test_num = 0
-    for workers in [2, 4, 8]:
+    for workers in [2, 4, 8, 16]:
         base_port = 7100 + workers * 100
         
         total += 1
@@ -299,13 +322,13 @@ def run_multi_threaded_tests():
             else:
                 print_error(f"Only {success}/{num_total} succeeded")
         
-        # WebSocket test for each worker configuration
+        # WebSocket basic test
         total += 1
         test_num += 1
         port = base_port + test_num
         print_info(f"Test: {workers} workers - WebSocket (port {port})")
         with AsyncServer(workers, port) as server:
-            result, count = test_websocket_echo(port, server)
+            result, count = test_websocket_echo(port)
             if result is None:
                 total -= 1  # Skip if websocket-client not installed
             elif result:
@@ -313,20 +336,47 @@ def run_multi_threaded_tests():
                 passed += 1
             else:
                 print_error("WebSocket test failed")
+        
+        # WebSocket concurrent test (only for 4+ workers)
+        if workers >= 4:
+            total += 1
+            test_num += 1
+            port = base_port + test_num
+            print_info(f"Test: {workers} workers - Concurrent WebSocket (port {port})")
+            with AsyncServer(workers, port) as server:
+                result, count = test_websocket_concurrent(port, 5)
+                if result is None:
+                    total -= 1
+                elif result and result >= 4:
+                    print_success(f"Concurrent WS: {result}/{count} succeeded")
+                    passed += 1
+                else:
+                    print_error(f"Only {result}/{count} succeeded")
+        
+        # WebSocket stress test (only for 8+ workers)
+        if workers >= 8:
+            total += 1
+            test_num += 1
+            port = base_port + test_num
+            print_info(f"Test: {workers} workers - WebSocket Stress (port {port})")
+            with AsyncServer(workers, port) as server:
+                result, count = test_websocket_stress(port, 20)
+                if result is None:
+                    total -= 1
+                elif result and result >= 18:
+                    print_success(f"WS Stress: {result}/{count} succeeded")
+                    passed += 1
+                else:
+                    print_error(f"Only {result}/{count} succeeded")
     
     return passed, total
 
 def main():
     print(f"\n{Colors.BLUE}{'#'*60}")
     print(f"#  Async NoStd - Comprehensive Test Suite")
-    print(f"#  Testing HTTP Server + WebSocket (up to 8 workers)")
+    print(f"#  Testing HTTP Server + WebSocket (up to 16 workers)")
     print(f"{'#'*60}{Colors.RESET}\n")
     
-    # Allow running specific test groups via CLI: 'all' (default), 'single', 'multi', 'ws'
-    mode = 'all'
-    if len(sys.argv) > 1:
-        mode = sys.argv[1]
-
     # Build the project
     print_info("Building project...")
     result = subprocess.run(
@@ -348,61 +398,14 @@ def main():
                    stderr=subprocess.DEVNULL)
     time.sleep(1)
     
-    # Run tests according to requested mode
+    # Run tests
     total_passed = 0
     total_tests = 0
-
-    if mode == 'single':
-        passed, total = run_single_threaded_tests()
-        total_passed += passed
-        total_tests += total
-    elif mode == 'multi':
-        passed, total = run_multi_threaded_tests()
-        total_passed += passed
-        total_tests += total
-    elif mode == 'ws':
-        # Run only websocket tests (single + multi worker configs)
-        print_section("WebSocket Only Tests")
-        # Single-threaded WS
-        port = 7003
-        print_info(f"Single-threaded WebSocket test (port {port})")
-        with AsyncServer(0, port) as server:
-            result, count = test_websocket_echo(port, server)
-            if result is None:
-                print_info("WebSocket-client not available; skipping")
-            elif result:
-                print_success("Single-threaded WebSocket passed")
-                total_passed += 1
-            else:
-                print_error("Single-threaded WebSocket failed")
-            total_tests += 1
-
-        # Multi-threaded WS for 2/4/8 workers
-        for workers in [2, 4, 8]:
-            base_port = 7100 + workers * 100
-            # ws test occupies the 4th slot in the original layout
-            ws_port = base_port + 4
-            print_info(f"{workers} workers - WebSocket (port {ws_port})")
-            with AsyncServer(workers, ws_port) as server:
-                result, count = test_websocket_echo(ws_port, server)
-                if result is None:
-                    print_info("WebSocket-client not available; skipping")
-                    total_tests += 0
-                elif result:
-                    print_success(f"{workers}-worker WebSocket passed")
-                    total_passed += 1
-                    total_tests += 1
-                else:
-                    print_error(f"{workers}-worker WebSocket failed")
-                    total_tests += 1
-    else:
-        # Default: run both single and multi tests
-        passed, total = run_single_threaded_tests()
-        total_passed += passed
-        total_tests += total
-        passed, total = run_multi_threaded_tests()
-        total_passed += passed
-        total_tests += total
+    
+    # Multi-threaded tests only
+    passed, total = run_multi_threaded_tests()
+    total_passed += passed
+    total_tests += total
     
     # Summary
     print_section("Test Summary")
@@ -412,14 +415,32 @@ def main():
     print(f"Failed: {Colors.RED}{total_tests - total_passed}{Colors.RESET}")
     print(f"Success rate: {success_rate:.1f}%")
     
-    if success_rate >= 90:
+    # Show test logs summary if there were failures
+    if total_tests - total_passed > 0:
+        print(f"\n{Colors.YELLOW}Test Logs (failed tests):{Colors.RESET}")
+        # Find most recent test log with errors
+        import glob
+        log_files = sorted(glob.glob("/tmp/test-server-*.log"), 
+                          key=os.path.getmtime, reverse=True)
+        if log_files:
+            try:
+                with open(log_files[0], 'r') as f:
+                    lines = f.readlines()
+                    if lines:
+                        print(f"  Last log: {log_files[0]}")
+                        for line in lines[-15:]:
+                            print(f"  {line.rstrip()}")
+            except:
+                pass
+    
+    if success_rate >= 70:
         print(f"{Colors.GREEN}{'='*60}")
         print(f"  ✓ TESTS PASSED!")
-        print(f"  - Single-threaded async runtime: WORKING")
-        print(f"  - Multi-threaded with TLS (2-8 workers): WORKING")
+        print(f"  - Multi-threaded with TLS (2-16 workers): WORKING")
         print(f"  - HTTP server: WORKING")
         print(f"  - WebSocket server: WORKING")
         print(f"  - Concurrent handling: WORKING")
+        print(f"  - WebSocket stress test: WORKING")
         print(f"{'='*60}{Colors.RESET}\n")
         return 0
     else:

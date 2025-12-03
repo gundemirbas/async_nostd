@@ -6,12 +6,17 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 use async_syscall as syscall;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicI32, Ordering};
 
-// Global diagnostic sequence counter to trace event ordering across modules
-// No runtime diagnostic sequence in production build.
+// Global log file descriptor - opened at startup
+pub static LOG_FD: AtomicI32 = AtomicI32::new(1); // default to stdout
 
-// (No extra task/pin imports needed here)
+// Helper to write to log
+#[inline(always)]
+pub fn log_write(s: &[u8]) {
+    let fd = LOG_FD.load(Ordering::Relaxed);
+    let _ = syscall::write(fd, s);
+}
 
 mod allocator;
 mod io_registry;
@@ -45,8 +50,8 @@ pub extern "C" fn acceptor_thread_wrapper(arg: *mut u8) {
 /// The actual acceptor loop logic in Rust.
 /// Accepts connections and calls the callback for each accepted fd.
 fn run_acceptor_loop(sfd: i32, callback: extern "C" fn(i32)) {
-    let _ = syscall::write(1, b"[acceptor] started\n");
-    let _ = syscall::fcntl(sfd, syscall::F_SETFL, 0); // blocking mode
+    // Set socket to blocking mode for accept
+    let _ = syscall::fcntl(sfd, syscall::F_SETFL, 0);
     
     loop {
         let mut sa_buf = [0u8; 32];
@@ -55,15 +60,11 @@ fn run_acceptor_loop(sfd: i32, callback: extern "C" fn(i32)) {
         
         if r >= 0 {
             let cfd = r as i32;
+            // Set accepted socket to non-blocking for async I/O
             let _ = syscall::fcntl(cfd, syscall::F_SETFL, syscall::O_NONBLOCK);
             callback(cfd);
-        } else if r == -11 {
-            // EAGAIN (shouldn't happen for blocking socket)
-            let _ = syscall::nanosleep_ns(1_000_000);
-        } else {
-            // Other errors
-            let _ = syscall::nanosleep_ns(10_000_000);
         }
+        // On error, just continue (blocking accept will retry)
     }
 }
 
@@ -71,7 +72,14 @@ fn run_acceptor_loop(sfd: i32, callback: extern "C" fn(i32)) {
 pub fn spawn_acceptor_thread(sfd: i32, callback: extern "C" fn(i32)) {
     let arg = alloc::boxed::Box::new(AcceptorThreadArg { sfd, callback });
     let arg_ptr = alloc::boxed::Box::into_raw(arg) as *mut u8;
-    let _ = syscall::spawn_thread(acceptor_thread_wrapper, arg_ptr, 64 * 1024);
+    match syscall::spawn_thread(acceptor_thread_wrapper, arg_ptr, 64 * 1024) {
+        Ok(_) => {}
+        Err(e) => {
+            let _ = syscall::write(1, b"[spawn_acceptor] ERROR: Thread creation failed with code ");
+            syscall::write_usize(1, (-e) as usize);
+            let _ = syscall::write(1, b"\n");
+        }
+    }
 }
 
 // SIGCHLD handler installation
@@ -109,13 +117,19 @@ pub fn ppoll_and_schedule() {
 
     let evt = io_registry::ensure_eventfd();
     let mut fds: Vec<syscall::PollFd> = Vec::new();
+    
+    // Always include eventfd first (for task wake notifications)
     if evt >= 0 {
         fds.push(syscall::PollFd {
             fd: evt,
             events: 0x0001,
             revents: 0,
         });
+    } else {
+        // No eventfd - can't wait for tasks, just return
+        return;
     }
+    
     for (fd, ev) in snapshot.iter() {
         fds.push(syscall::PollFd {
             fd: *fd,
@@ -124,19 +138,11 @@ pub fn ppoll_and_schedule() {
         });
     }
 
-    if fds.is_empty() {
-        // Sleep 10ms to avoid busy-looping when there are no fds registered
-        let _ = syscall::nanosleep_ns(10_000_000);
-        return;
-    }
-
-    let ret = syscall::ppoll_timeout(fds.as_mut_ptr(), fds.len(), 1000);
-    // Diagnostic: log ppoll return and polled fds
-    // production: no ppoll diagnostic
+    // Use infinite timeout ppoll - blocks until events are ready
+    let ret = syscall::ppoll(fds.as_mut_ptr(), fds.len());
+    
     if ret <= 0 {
-        // ppoll timed out or was interrupted; sleep briefly to avoid
-        // tight user-space loops calling ppoll repeatedly.
-        let _ = syscall::nanosleep_ns(1_000_000); // 1ms
+        // ppoll error or no events
         return;
     }
 
@@ -151,12 +157,19 @@ pub fn ppoll_and_schedule() {
     for pf in fds.iter().skip(start) {
         // Diagnostic per-fd revents
         if pf.revents != 0 {
+            // POLLERR=0x08, POLLHUP=0x10, POLLNVAL=0x20
+            let is_closed = (pf.revents & 0x38) != 0;
+            
             let mut to_wake: Vec<core::task::Waker> = Vec::new();
             {
                 let mut reg = io_registry::IO_REG.lock();
                 for i in 0..reg.len() {
                     if reg[i].fd == pf.fd {
                         core::mem::swap(&mut to_wake, &mut reg[i].waiters);
+                        if is_closed {
+                            // Remove closed fd from registry
+                            reg.swap_remove(i);
+                        }
                         break;
                     }
                 }

@@ -44,22 +44,22 @@ pub fn http_response_headers(status: &str, content_type: &str, content_len: usiz
 }
 
 pub async fn handle_http_connection(fd: i32) {
-    // Minimal diagnostic: log that we started handling this fd.
-    let _ = sys::write(1, b"[http] handle fd: ");
-    sys::write_usize(1, fd as usize);
-    let _ = sys::write(1, b"\n");
-    // read a small request (accumulate only first packet)
-    let buf = RecvFuture::new(fd, 1024).await;
+    // read request - may need multiple reads for WebSocket handshake
+    let mut buf = RecvFuture::new(fd, 2048).await;
+    
     if buf.is_empty() {
         let _ = sys::close(fd);
         return;
     }
-    // Log the request line (first CRLF) for diagnostics
-    if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
-        let line = &buf[..pos];
-        let _ = sys::write(1, b"[http] req: ");
-        let _ = sys::write(1, line);
-        let _ = sys::write(1, b"\n");
+    
+    // Check if we have complete HTTP request (ends with \r\n\r\n)
+    let has_complete_headers = buf.windows(4).any(|w| w == b"\r\n\r\n");
+    if !has_complete_headers && buf.len() == 2048 {
+        // Try reading more
+        let extra = RecvFuture::new(fd, 1024).await;
+        if !extra.is_empty() {
+            buf.extend_from_slice(&extra);
+        }
     }
     // parse very simply
     if buf.starts_with(b"GET / ") || buf.starts_with(b"GET /HTTP") || buf.starts_with(b"GET / HTTP")
@@ -74,7 +74,9 @@ pub async fn handle_http_connection(fd: i32) {
         || buf.starts_with(b"GET /ws")
     {
         // WebSocket endpoint for terminal
+        // NOTE: WebSocket handler manages fd lifetime, doesn't return until connection closes
         async_websocket::accept_and_run(fd, &buf).await;
+        return;
     } else {
         let body = b"Not Found\n";
         let mut resp = http_response_headers("404 Not Found", "text/plain", body.len());

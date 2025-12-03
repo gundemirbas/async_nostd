@@ -179,7 +179,7 @@ pub fn dump_scheduled(limit: usize) {
     while !cur.is_null() && i < limit {
         unsafe {
             let h = (*cur).handle;
-            let _ = sys::write(1, b"[sched_dump] handle: ");
+            let _ = sys::write(1, b"handle: ");
             sys::write_usize(1, h);
             let _ = sys::write(1, b"\n");
             cur = (*cur).next;

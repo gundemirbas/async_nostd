@@ -209,6 +209,14 @@ pub fn fcntl(fd: i32, cmd: i32, arg: usize) -> isize {
 
 pub const F_SETFL: i32 = 4;
 pub const O_NONBLOCK: usize = 0x800;
+pub const O_WRONLY: i32 = 0x1;
+pub const O_CREAT: i32 = 0x40;
+pub const O_TRUNC: i32 = 0x200;
+
+pub fn open(path: *const u8, flags: i32, mode: u32) -> i32 {
+    let ret = unsafe { syscall3(2, path as u64, flags as u64, mode as u64) };
+    if ret < 0 { -1 } else { ret as i32 }
+}
 
 // Socket syscalls
 pub fn socket(domain: i32, type_: i32, protocol: i32) -> i32 {
