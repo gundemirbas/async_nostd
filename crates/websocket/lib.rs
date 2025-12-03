@@ -212,8 +212,43 @@ pub async fn accept_and_run(fd: i32, request: &[u8]) {
         let _ = send_ws_payload(fd, welcome).await;
 
         // Notify local console that a websocket connection has been established.
-        // Tests rely on this exact string to detect successful handshake.
-        let _ = sys::write(1, b"[ws connected]\n");
+        // Prefer a detailed line with remote IP:port so tests and logs can
+        // attribute the connection. Fall back to a simple marker if
+        // peer lookup fails.
+        let mut addr_buf: [u8; 16] = [0u8; 16];
+        let mut addr_len: usize = core::mem::size_of::<[u8; 16]>();
+        if sys::getpeername(fd, addr_buf.as_mut_ptr(), &mut addr_len as *mut usize) >= 0 {
+            // Parse sockaddr_in layout: sin_family(u16), sin_port(u16), sin_addr(u32), sin_zero[8]
+            let sin_port_be = u16::from_be_bytes([addr_buf[2], addr_buf[3]]);
+            let sin_addr_be = u32::from_be_bytes([addr_buf[4], addr_buf[5], addr_buf[6], addr_buf[7]]);
+            let ip_a = ((sin_addr_be >> 24) & 0xff) as usize;
+            let ip_b = ((sin_addr_be >> 16) & 0xff) as usize;
+            let ip_c = ((sin_addr_be >> 8) & 0xff) as usize;
+            let ip_d = (sin_addr_be & 0xff) as usize;
+            let port = sys::ntohs(sin_port_be) as usize;
+
+            // Build message: [ws connected] ip=a.b.c.d port=NNNN\n
+            let mut out: Vec<u8> = Vec::new();
+            out.extend_from_slice(b"[ws connected] ip=");
+            let (b1, l1) = sys::format_usize(ip_a);
+            out.extend_from_slice(&b1[..l1]);
+            out.push(b'.');
+            let (b2, l2) = sys::format_usize(ip_b);
+            out.extend_from_slice(&b2[..l2]);
+            out.push(b'.');
+            let (b3, l3) = sys::format_usize(ip_c);
+            out.extend_from_slice(&b3[..l3]);
+            out.push(b'.');
+            let (b4, l4) = sys::format_usize(ip_d);
+            out.extend_from_slice(&b4[..l4]);
+            out.extend_from_slice(b" port=");
+            let (bp, lp) = sys::format_usize(port);
+            out.extend_from_slice(&bp[..lp]);
+            out.push(b'\n');
+            let _ = sys::write(1, &out);
+        } else {
+            let _ = sys::write(1, b"[ws connected]\n");
+        }
 
         // enter buffered frame loop: accumulate recv bytes and parse frames incrementally.
         let mut buf_acc: Vec<u8> = Vec::new();
