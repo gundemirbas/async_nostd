@@ -41,7 +41,7 @@ impl Executor {
         }
 
         for _ in 0..num_workers {
-            let _ = async_syscall::spawn_thread(worker_wrapper, core::ptr::null_mut(), 64 * 1024);
+            let _ = async_syscall::spawn_thread(worker_wrapper, core::ptr::null_mut(), async_runtime::WORKER_STACK_SIZE);
         }
         // Main thread becomes a worker too
         worker_loop(core::ptr::null_mut())

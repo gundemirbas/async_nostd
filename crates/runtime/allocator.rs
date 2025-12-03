@@ -1,10 +1,9 @@
 //! Bump allocator - simple, fast, no deallocation
 
 use crate::syscall;
+use crate::config::HEAP_SIZE;
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicUsize, Ordering};
-
-const HEAP_SIZE: usize = 16 * 1024 * 1024;
 static HEAP_START: AtomicUsize = AtomicUsize::new(0);
 static HEAP_CUR: AtomicUsize = AtomicUsize::new(0);
 static HEAP_END: AtomicUsize = AtomicUsize::new(0);

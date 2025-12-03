@@ -48,7 +48,7 @@ fn create_listening_socket(ip: u32, port: usize) -> Result<i32, ()> {
         return Err(());
     }
     
-    let listen_result = sys::listen(sfd, 128);
+    let listen_result = sys::listen(sfd, async_runtime::LISTEN_BACKLOG);
     if listen_result < 0 {
         let _ = sys::close(sfd);
         return Err(());
@@ -57,13 +57,12 @@ fn create_listening_socket(ip: u32, port: usize) -> Result<i32, ()> {
     Ok(sfd)
 }
 
-/// Helper: Print socket info (fd and bound port).
-fn print_socket_info(_sfd: i32) {
-    // Info already printed in main
-}
-
 /// Callback invoked by acceptor thread for each accepted connection.
 extern "C" fn handle_accepted_connection(cfd: i32) {
+    async_runtime::log_write(b"[ACCEPT] fd=");
+    sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), cfd as usize);
+    async_runtime::log_write(b"\n");
+    
     let task = alloc::boxed::Box::new(http::handle_http_connection(cfd));
     let handle = async_runtime::register_task(task);
     async_runtime::wake_handle(handle);
@@ -75,7 +74,7 @@ extern "C" fn handle_accepted_connection(cfd: i32) {
 pub extern "C" fn main(worker_count: usize, listen_ip: u32, listen_port: usize) -> ! {
     // Open log file
     let log_fd = sys::open(
-        b"/tmp/async-nostd.log\0".as_ptr(),
+        async_runtime::LOG_FILE_PATH.as_ptr(),
         sys::O_WRONLY | sys::O_CREAT | sys::O_TRUNC,
         0o644,
     );
@@ -96,8 +95,6 @@ pub extern "C" fn main(worker_count: usize, listen_ip: u32, listen_port: usize) 
         Ok(fd) => fd,
         Err(_) => sys::exit(1),
     };
-    
-    print_socket_info(sfd);
 
     // Spawn acceptor thread using runtime helper
     let _ = async_runtime::spawn_acceptor_thread(sfd, handle_accepted_connection);

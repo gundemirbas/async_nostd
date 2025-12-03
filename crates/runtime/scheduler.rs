@@ -15,10 +15,10 @@ struct Node {
 static SCHEDULE_HEAD: AtomicPtr<Node> = AtomicPtr::new(core::ptr::null_mut());
 static FREELIST_HEAD: AtomicPtr<Node> = AtomicPtr::new(core::ptr::null_mut());
 static FREELIST_COUNT: AtomicUsize = AtomicUsize::new(0);
-const FREELIST_MAX: usize = 256;
+use crate::config::FREELIST_MAX;
 
 // Per-slot task storage
-const MAX_TASK_SLOTS: usize = 1024;
+use crate::config::MAX_TASK_SLOTS;
 
 struct Slot {
     generation: AtomicUsize,

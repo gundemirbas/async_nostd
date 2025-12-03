@@ -8,6 +8,9 @@ use alloc::vec::Vec;
 use async_syscall as syscall;
 use core::sync::atomic::{AtomicI32, Ordering};
 
+mod config;
+pub use config::*;
+
 // Global log file descriptor - opened at startup
 pub static LOG_FD: AtomicI32 = AtomicI32::new(1); // default to stdout
 
@@ -72,7 +75,7 @@ fn run_acceptor_loop(sfd: i32, callback: extern "C" fn(i32)) {
 pub fn spawn_acceptor_thread(sfd: i32, callback: extern "C" fn(i32)) {
     let arg = alloc::boxed::Box::new(AcceptorThreadArg { sfd, callback });
     let arg_ptr = alloc::boxed::Box::into_raw(arg) as *mut u8;
-    match syscall::spawn_thread(acceptor_thread_wrapper, arg_ptr, 64 * 1024) {
+    match syscall::spawn_thread(acceptor_thread_wrapper, arg_ptr, WORKER_STACK_SIZE) {
         Ok(_) => {}
         Err(e) => {
             let _ = syscall::write(1, b"[spawn_acceptor] ERROR: Thread creation failed with code ");
@@ -154,9 +157,11 @@ pub fn ppoll_and_schedule() {
     }
 
     let start = if evt >= 0 { 1 } else { 0 };
+    let mut ready_count = 0;
     for pf in fds.iter().skip(start) {
         // Diagnostic per-fd revents
         if pf.revents != 0 {
+            ready_count += 1;
             // POLLERR=0x08, POLLHUP=0x10, POLLNVAL=0x20
             let is_closed = (pf.revents & 0x38) != 0;
             
@@ -168,6 +173,9 @@ pub fn ppoll_and_schedule() {
                         core::mem::swap(&mut to_wake, &mut reg[i].waiters);
                         if is_closed {
                             // Remove closed fd from registry
+                            log_write(b"[ppoll] removing closed fd=");
+                            syscall::write_usize(LOG_FD.load(Ordering::Relaxed), pf.fd as usize);
+                            log_write(b"\n");
                             reg.swap_remove(i);
                         }
                         break;
@@ -178,6 +186,12 @@ pub fn ppoll_and_schedule() {
                 w.wake();
             }
         }
+    }
+    
+    if ready_count > 0 {
+        log_write(b"[ppoll] ");
+        syscall::write_usize(LOG_FD.load(Ordering::Relaxed), ready_count);
+        log_write(b" fds ready\n");
     }
 }
 

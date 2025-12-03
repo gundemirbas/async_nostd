@@ -188,6 +188,10 @@ async fn send_ws_payload(fd: i32, payload: &[u8]) {
 }
 
 pub async fn accept_and_run(fd: i32, request: &[u8]) {
+    async_runtime::log_write(b"[WS] fd=");
+    sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), fd as usize);
+    async_runtime::log_write(b" handshake start\n");
+    
     // find Sec-WebSocket-Key header
     if let Some(key_bytes) = find_header_val(request, "Sec-WebSocket-Key") {
         // trim whitespace
@@ -251,8 +255,16 @@ pub async fn accept_and_run(fd: i32, request: &[u8]) {
             }
             off_sync += wrote;
         }
+        async_runtime::log_write(b"[WS] fd=");
+        sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), fd as usize);
+        async_runtime::log_write(b" handshake sent\n");
+        
         // Restore non-blocking mode for normal async operation
         let _ = sys::fcntl(fd, sys::F_SETFL, sys::O_NONBLOCK);
+        
+        async_runtime::log_write(b"[WS] fd=");
+        sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), fd as usize);
+        async_runtime::log_write(b" handshake complete\n");
 
         // Send welcome message with ANSI colors
         let welcome = b"\r\n\x1b[1;32m=== Async NoStd Terminal ===\x1b[0m\r\n\r\n\
@@ -274,9 +286,17 @@ Type anything to see it echoed back!\r\n\r\n";
         loop {
             let chunk = RecvFuture::new(fd, 4096).await;
             if chunk.is_empty() {
+                async_runtime::log_write(b"[WS] fd=");
+                sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), fd as usize);
+                async_runtime::log_write(b" client disconnected\n");
                 let _ = sys::close(fd);
                 return;
             }
+            async_runtime::log_write(b"[WS] fd=");
+            sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), fd as usize);
+            async_runtime::log_write(b" recv ");
+            sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), chunk.len());
+            async_runtime::log_write(b" bytes\n");
             buf_acc.extend_from_slice(&chunk);
 
             // parse as many frames as available
@@ -408,6 +428,9 @@ Type anything to see it echoed back!\r\n\r\n";
         }
     } else {
         // Sec-WebSocket-Key not found - invalid WebSocket handshake
+        async_runtime::log_write(b"[WS] fd=");
+        sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), fd as usize);
+        async_runtime::log_write(b" ERROR: No Sec-WebSocket-Key, closing\n");
         let _ = sys::close(fd);
     }
 }

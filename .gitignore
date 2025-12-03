@@ -1,4 +1,28 @@
+# Build artifacts
 /target
 
-# Ignore lock files (Cargo.lock, other .lock files)
+# Lock files
 *.lock
+Cargo.lock
+
+# Test artifacts
+/tmp/async-nostd.log
+/tmp/test_all_output.log
+test-server-*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
