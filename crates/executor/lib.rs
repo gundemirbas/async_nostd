@@ -11,25 +11,40 @@ use core::task::{Context, Poll};
 pub struct Executor;
 
 impl Clone for Executor {
-    fn clone(&self) -> Self { Self }
+    fn clone(&self) -> Self {
+        Self
+    }
+}
+
+impl Default for Executor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 static TASKS_REMAINING: AtomicUsize = AtomicUsize::new(0);
 
 impl Executor {
-    pub fn new() -> Self { Self }
-
-    pub fn enqueue_task(&self, task: Box<dyn Future<Output = ()> + Send + 'static>) -> Result<(), ()> {
-        let _ = async_runtime::register_task(task);
-        TASKS_REMAINING.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+    pub fn new() -> Self {
+        Self
     }
 
-    pub fn start_workers(&self, num_workers: usize) -> Result<(), ()> {
-        for _ in 0..num_workers {
-            async_syscall::spawn_thread(worker_trampoline, core::ptr::null_mut(), 64 * 1024)?;
+    pub fn enqueue_task(&self, task: Box<dyn Future<Output = ()> + Send + 'static>) {
+        let _ = async_runtime::register_task(task);
+        TASKS_REMAINING.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn start_workers(&self, num_workers: usize) -> ! {
+        // Wrapper to match spawn_thread signature
+        extern "C" fn worker_wrapper(arg: *mut u8) {
+            worker_loop(arg)
         }
-        Ok(())
+
+        for _ in 0..num_workers {
+            let _ = async_syscall::spawn_thread(worker_wrapper, core::ptr::null_mut(), 64 * 1024);
+        }
+        // Main thread becomes a worker too
+        worker_loop(core::ptr::null_mut())
     }
 
     pub fn wait_all(&self) {
@@ -39,15 +54,14 @@ impl Executor {
     }
 }
 
-extern "C" fn worker_trampoline(_arg: *mut u8) {
+extern "C" fn worker_loop(_arg: *mut u8) -> ! {
+    // Worker runs forever, polling tasks and handling IO
     loop {
-        if TASKS_REMAINING.load(Ordering::Relaxed) == 0 { break; }
-
         if let Some(handle) = async_runtime::take_scheduled_task() {
-            let waker = unsafe { async_runtime::create_waker_for_handle(handle) };
+            let waker = async_runtime::create_waker(handle);
             let mut cx = Context::from_waker(&waker);
-            let result = unsafe { async_runtime::poll_task(handle, &mut cx) };
-            if let Poll::Ready(_) = result {
+            let result = async_runtime::poll_task_safe(handle, &mut cx);
+            if matches!(result, Poll::Ready(_)) {
                 TASKS_REMAINING.fetch_sub(1, Ordering::Relaxed);
             }
             continue;
@@ -55,5 +69,4 @@ extern "C" fn worker_trampoline(_arg: *mut u8) {
 
         async_runtime::ppoll_and_schedule();
     }
-    async_syscall::exit(0);
 }

@@ -1,0 +1,12 @@
+[package]
+name = "async-websocket"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+async-syscall = { path = "../syscall" }
+async-runtime = { path = "../runtime" }
+async-net = { path = "../net" }

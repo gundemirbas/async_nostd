@@ -12,6 +12,9 @@ async-syscall = { path = "crates/syscall" }
 async-runtime = { path = "crates/runtime" }
 async-executor = { path = "crates/executor" }
 async-net = { path = "crates/net" }
+async-pty = { path = "crates/pty" }
+async-http = { path = "crates/http" }
+async-websocket = { path = "crates/websocket" }
 
 [profile.dev]
 panic = "abort"

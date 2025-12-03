@@ -1,152 +1,100 @@
-//! Async runtime core
+//! Async runtime core - modular architecture
 
 #![no_std]
 
 extern crate alloc;
-use alloc::boxed::Box;
+use alloc::vec;
 use alloc::vec::Vec;
-use core::future::Future;
-use core::sync::atomic::{AtomicUsize, AtomicPtr, AtomicI32, Ordering};
-use core::task::Waker;
 use async_syscall as syscall;
+use core::sync::atomic::Ordering;
 
-// Allocator
-mod allocator {
-    use core::alloc::{GlobalAlloc, Layout};
-    use core::sync::atomic::{AtomicUsize, Ordering};
-    use async_syscall::mmap;
+mod allocator;
+mod io_registry;
+mod scheduler;
 
-    const HEAP_SIZE: usize = 16 * 1024 * 1024;
-    static HEAP_START: AtomicUsize = AtomicUsize::new(0);
-    static HEAP_CUR: AtomicUsize = AtomicUsize::new(0);
-    static HEAP_END: AtomicUsize = AtomicUsize::new(0);
+// Re-export public API
+pub use io_registry::{close_eventfd, register_fd_waker};
+pub use scheduler::{
+    create_waker, poll_task_safe, register_task, take_scheduled_task, wake_handle,
+};
 
-    pub struct BumpAllocator;
+// SIGCHLD handler installation
+fn install_sigchld_handler() {
+    // SA_NOCLDWAIT = 0x02 - automatically reap children
+    let sa_handler: u64 = 0;
+    let sa_flags: u64 = 0x02;
+    let sa_restorer: u64 = 0;
+    let sa_mask = [0u64; 16];
 
-    unsafe impl GlobalAlloc for BumpAllocator {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            if HEAP_START.load(Ordering::Relaxed) == 0 {
-                let ptr = mmap(0, HEAP_SIZE, 3, 0x22);
-                if !ptr.is_null() {
-                    let addr = ptr as usize;
-                    HEAP_START.store(addr, Ordering::Relaxed);
-                    HEAP_CUR.store(addr, Ordering::Relaxed);
-                    HEAP_END.store(addr + HEAP_SIZE, Ordering::Relaxed);
-                }
-            }
+    let mut sigaction = [0u64; 32];
+    sigaction[0] = sa_handler;
+    sigaction[1] = sa_flags;
+    sigaction[2] = sa_restorer;
+    sigaction[3..(3 + sa_mask.len())].copy_from_slice(&sa_mask);
 
-            let align = layout.align().max(1);
-            let size = layout.size();
-            if size == 0 { return align as *mut u8; }
-
-            loop {
-                let cur = HEAP_CUR.load(Ordering::Relaxed);
-                let aligned = (cur + align - 1) & !(align - 1);
-                let next = match aligned.checked_add(size) {
-                    Some(n) => n,
-                    None => return core::ptr::null_mut(),
-                };
-                if next > HEAP_END.load(Ordering::Relaxed) {
-                    return core::ptr::null_mut();
-                }
-                if HEAP_CUR.compare_exchange(cur, next, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-                    return aligned as *mut u8;
-                }
-            }
-        }
-        unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
-    }
-
-    #[global_allocator]
-    static ALLOC: BumpAllocator = BumpAllocator;
-}
-
-// Task scheduler
-struct Node { handle: usize, next: *mut Node }
-static SCHEDULE_HEAD: AtomicPtr<Node> = AtomicPtr::new(core::ptr::null_mut());
-static FREELIST_HEAD: AtomicPtr<Node> = AtomicPtr::new(core::ptr::null_mut());
-static FREELIST_COUNT: AtomicUsize = AtomicUsize::new(0);
-static NEXT_HANDLE: AtomicUsize = AtomicUsize::new(1);
-const FREELIST_MAX: usize = 256;
-
-static TASK_TABLE: spin::Mutex<Option<Vec<Option<Box<dyn Future<Output = ()> + Send>>>>> =
-    spin::Mutex::new(None);
-
-struct IoEntry {
-    fd: i32,
-    events: i16,
-    waiters: Vec<Waker>,
-}
-static IO_REG: spin::Mutex<Vec<IoEntry>> = spin::Mutex::new(Vec::new());
-static EVENTFD: AtomicI32 = AtomicI32::new(-1);
-static EVENT_PENDING: AtomicUsize = AtomicUsize::new(0);
-
-fn ensure_eventfd() -> i32 {
-    let cur = EVENTFD.load(Ordering::Relaxed);
-    if cur >= 0 { return cur; }
-    let fd = syscall::eventfd(0, 0);
-    if fd >= 0 {
-        if EVENTFD.compare_exchange(-1, fd, Ordering::Relaxed, Ordering::Relaxed).is_err() {
-            let _ = syscall::close(fd);
-        }
-        return EVENTFD.load(Ordering::Relaxed);
-    }
-    -1
-}
-
-fn signal_eventfd() {
-    let fd = ensure_eventfd();
-    if fd < 0 { return; }
-    let v: u64 = 1;
-    let _ = syscall::write(fd, unsafe {
-        core::slice::from_raw_parts(&v as *const u64 as *const u8, 8)
-    });
-}
-
-pub fn close_eventfd() {
-    let fd = EVENTFD.swap(-1, Ordering::Relaxed);
-    if fd >= 0 { let _ = syscall::close(fd); }
-}
-
-pub fn register_fd_waker(fd: i32, events: i16, waker: Waker) {
-    let mut reg = IO_REG.lock();
-    for e in reg.iter_mut() {
-        if e.fd == fd {
-            e.waiters.push(waker);
-            return;
-        }
-    }
-    let mut v = Vec::new();
-    v.push(waker);
-    reg.push(IoEntry { fd, events, waiters: v });
+    let _ = syscall::rt_sigaction(
+        17,
+        sigaction.as_ptr() as *const u8,
+        core::ptr::null_mut(),
+        8,
+    );
 }
 
 pub fn ppoll_and_schedule() {
+    // Reap exited child processes
+    loop {
+        let mut status: i32 = 0;
+        let r = syscall::waitpid(-1, &mut status as *mut i32, 1);
+        if r <= 0 {
+            break;
+        }
+    }
+
     let snapshot: Vec<(i32, i16)> = {
-        let reg = IO_REG.lock();
+        let reg = io_registry::IO_REG.lock();
         reg.iter().map(|e| (e.fd, e.events)).collect()
     };
 
-    let evt = ensure_eventfd();
+    let evt = io_registry::ensure_eventfd();
     let mut fds: Vec<syscall::PollFd> = Vec::new();
     if evt >= 0 {
-        fds.push(syscall::PollFd { fd: evt, events: 0x0001, revents: 0 });
+        fds.push(syscall::PollFd {
+            fd: evt,
+            events: 0x0001,
+            revents: 0,
+        });
     }
     for (fd, ev) in snapshot.iter() {
-        fds.push(syscall::PollFd { fd: *fd, events: *ev, revents: 0 });
+        fds.push(syscall::PollFd {
+            fd: *fd,
+            events: *ev,
+            revents: 0,
+        });
     }
 
-    if fds.is_empty() { return; }
+    if fds.is_empty() {
+        syscall::nanosleep(10_000_000);
+        return;
+    }
 
-    let ret = syscall::ppoll(fds.as_mut_ptr(), fds.len());
-    if ret <= 0 { return; }
+    let ret = syscall::ppoll_timeout(fds.as_mut_ptr(), fds.len(), 1000);
+    if ret <= 0 {
+        return;
+    }
+
+    // Drain eventfd
+    if evt >= 0 && fds[0].revents != 0 {
+        let mut buf = [0u8; 8];
+        let _ = syscall::read(evt, &mut buf);
+        io_registry::EVENT_PENDING.store(0, Ordering::Relaxed);
+    }
 
     let start = if evt >= 0 { 1 } else { 0 };
     for pf in fds.iter().skip(start) {
         if pf.revents != 0 {
-            let mut to_wake: Vec<Waker> = Vec::new();
+            let mut to_wake: Vec<core::task::Waker> = Vec::new();
             {
-                let mut reg = IO_REG.lock();
+                let mut reg = io_registry::IO_REG.lock();
                 for i in 0..reg.len() {
                     if reg[i].fd == pf.fd {
                         core::mem::swap(&mut to_wake, &mut reg[i].waiters);
@@ -154,167 +102,42 @@ pub fn ppoll_and_schedule() {
                     }
                 }
             }
-            for w in to_wake { w.wake(); }
-        }
-    }
-}
-
-fn alloc_node(handle: usize) -> *mut Node {
-    loop {
-        let head = FREELIST_HEAD.load(Ordering::Acquire);
-        if head.is_null() {
-            return Box::into_raw(Box::new(Node { handle, next: core::ptr::null_mut() }));
-        }
-        let next = unsafe { (*head).next };
-        if FREELIST_HEAD.compare_exchange(head, next, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            FREELIST_COUNT.fetch_sub(1, Ordering::Relaxed);
-            unsafe {
-                (*head).handle = handle;
-                (*head).next = core::ptr::null_mut();
+            for w in to_wake {
+                w.wake();
             }
-            return head;
         }
     }
-}
-
-fn free_node(ptr: *mut Node) {
-    if FREELIST_COUNT.load(Ordering::Relaxed) >= FREELIST_MAX {
-        unsafe { let _ = Box::from_raw(ptr); }
-        return;
-    }
-    FREELIST_COUNT.fetch_add(1, Ordering::Relaxed);
-    loop {
-        let head = FREELIST_HEAD.load(Ordering::Acquire);
-        unsafe { (*ptr).next = head; }
-        if FREELIST_HEAD.compare_exchange(head, ptr, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            break;
-        }
-    }
-}
-
-pub fn wake_handle(handle: usize) {
-    let node = alloc_node(handle);
-    loop {
-        let head = SCHEDULE_HEAD.load(Ordering::Acquire);
-        unsafe { (*node).next = head; }
-        if SCHEDULE_HEAD.compare_exchange(head, node, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            break;
-        }
-    }
-    let prev = EVENT_PENDING.fetch_add(1, Ordering::Relaxed);
-    if prev == 0 { signal_eventfd(); }
-}
-
-pub fn take_scheduled_task() -> Option<usize> {
-    loop {
-        let head = SCHEDULE_HEAD.load(Ordering::Acquire);
-        if head.is_null() { return None; }
-        let next = unsafe { (*head).next };
-        if SCHEDULE_HEAD.compare_exchange(head, next, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            let handle = unsafe { (*head).handle };
-            free_node(head);
-            return Some(handle);
-        }
-    }
-}
-
-pub fn register_task(task: Box<dyn Future<Output = ()> + Send + 'static>) -> usize {
-    let mut table = TASK_TABLE.lock();
-    if table.is_none() { *table = Some(Vec::new()); }
-    let t = table.as_mut().unwrap();
-
-    let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    let idx = handle - 1;
-    while idx >= t.len() { t.push(None); }
-    t[idx] = Some(task);
-    drop(table);
-    wake_handle(handle);
-    handle
-}
-
-pub unsafe fn poll_task(handle: usize, cx: &mut core::task::Context<'_>) -> core::task::Poll<()> {
-    let mut table = TASK_TABLE.lock();
-    if table.is_none() { return core::task::Poll::Ready(()); }
-    let t = table.as_mut().unwrap();
-    let idx = handle - 1;
-    if idx >= t.len() || t[idx].is_none() { return core::task::Poll::Ready(()); }
-
-    let mut task = t[idx].take().unwrap();
-    drop(table);
-
-    let res = unsafe {
-        use core::pin::Pin;
-        Pin::new_unchecked(task.as_mut()).poll(cx)
-    };
-
-    match res {
-        core::task::Poll::Ready(()) => {
-            drop(task);
-            core::task::Poll::Ready(())
-        }
-        core::task::Poll::Pending => {
-            let mut table = TASK_TABLE.lock();
-            if let Some(t) = table.as_mut() {
-                if idx < t.len() {
-                    t[idx] = Some(task);
-                }
-            }
-            core::task::Poll::Pending
-        }
-    }
-}
-
-pub unsafe fn create_waker_for_handle(handle: usize) -> Waker {
-    use core::task::{RawWaker, RawWakerVTable, Waker};
-
-    unsafe fn clone(data: *const ()) -> RawWaker { RawWaker::new(data, &VTABLE) }
-    unsafe fn wake(data: *const ()) { wake_handle(data as usize); }
-    unsafe fn wake_by_ref(data: *const ()) { wake_handle(data as usize); }
-    unsafe fn drop(_: *const ()) {}
-
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-    unsafe { Waker::from_raw(RawWaker::new(handle as *const (), &VTABLE)) }
-}
-
-// Entry point
-#[unsafe(naked)]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn _start() -> ! {
-    core::arch::naked_asm!(
-        "xor rbp, rbp",
-        "pop rdi",
-        "mov rsi, rsp",
-        "and rsp, ~0xf",
-        "push 0",
-        "call {main}",
-        main = sym main_trampoline,
-    )
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn main_trampoline(argc: isize, argv: *const *const u8) -> ! {
-    unsafe { crate::main(argc, argv) }
-}
-
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    syscall::exit(1);
 }
 
 // Utilities
-pub fn read_ptr_array(ptr: *const *const u8, index: isize) -> *const u8 {
+/// Read a C-style argv array pointer at `index`.
+///
+/// # Safety
+/// `ptr` must be a valid pointer to an array of `*const u8` values with at least
+/// `index + 1` entries. The function performs a raw pointer offset and dereference.
+pub unsafe fn read_ptr_array(ptr: *const *const u8, index: isize) -> *const u8 {
     unsafe { *ptr.offset(index) }
 }
 
-pub fn parse_cstring_usize(s: *const u8) -> Option<usize> {
-    if s.is_null() { return None; }
+/// Parse a NUL-terminated ASCII decimal string into a `usize`.
+///
+/// # Safety
+/// `s` must be a valid pointer to a NUL-terminated ASCII string accessible for
+/// up to 64 bytes. The function reads memory from `s` until a NUL or non-digit
+/// byte is found.
+pub unsafe fn parse_cstring_usize(s: *const u8) -> Option<usize> {
+    if s.is_null() {
+        return None;
+    }
     unsafe {
         let mut i: isize = 0;
         let mut acc: usize = 0;
         let mut any = false;
         while i < 64 {
             let c = *s.offset(i);
-            if c == 0 || c < b'0' || c > b'9' { break; }
+            if c == 0 || !c.is_ascii_digit() {
+                break;
+            }
             any = true;
             acc = acc * 10 + ((c - b'0') as usize);
             i += 1;
@@ -323,6 +146,140 @@ pub fn parse_cstring_usize(s: *const u8) -> Option<usize> {
     }
 }
 
+/// Create a Vec<u8> by copying `len` bytes from `ptr`.
+///
+/// # Safety
+/// `ptr` must be valid for reads of `len` bytes. The function performs a raw
+/// memory copy into a freshly allocated Vec.
+pub unsafe fn vec_from_ptr(ptr: *const u8, len: usize) -> Vec<u8> {
+    let mut v = vec![0u8; len];
+    unsafe {
+        core::ptr::copy_nonoverlapping(ptr, v.as_mut_ptr(), len);
+    }
+    v
+}
+
+pub fn vec_with_len(len: usize) -> Vec<u8> {
+    vec![0u8; len]
+}
+
+pub fn set_vec_len(v: &mut Vec<u8>, new_len: usize) {
+    v.truncate(new_len);
+}
+
+/// Parse a NUL-terminated IPv4 address (dotted decimal) into a u32 (little-endian).
+///
+/// # Safety
+/// `s` must be a valid pointer to a NUL-terminated ASCII string containing a
+/// dotted-decimal IPv4 address (e.g. "127.0.0.1"). The function reads up to
+/// 128 bytes from `s` when parsing.
+pub unsafe fn parse_cstring_ip(s: *const u8) -> Option<u32> {
+    if s.is_null() {
+        return None;
+    }
+    let mut i: isize = 0;
+    let mut part: usize = 0;
+    let mut acc: usize = 0;
+    let mut parts = [0u8; 4];
+    while i < 128 {
+        let c = unsafe { *s.offset(i) };
+        if c == 0 {
+            if part != 3 {
+                return None;
+            }
+            parts[part] = acc as u8;
+            // Little-endian for x86_64 memory layout
+            let v = (parts[0] as u32)
+                | ((parts[1] as u32) << 8)
+                | ((parts[2] as u32) << 16)
+                | ((parts[3] as u32) << 24);
+            return Some(v);
+        }
+        if c == b'.' {
+            if part >= 3 {
+                return None;
+            }
+            parts[part] = acc as u8;
+            part += 1;
+            acc = 0;
+        } else if c.is_ascii_digit() {
+            acc = acc * 10 + ((c - b'0') as usize);
+            if acc > 255 {
+                return None;
+            }
+        } else {
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+// Entry point assembly - must be naked, no prologue
+core::arch::global_asm!(
+    ".section .text._start,\"ax\",@progbits",
+    ".globl _start",
+    ".type _start, @function",
+    "_start:",
+    "pop rdi",              // argc
+    "mov rsi, rsp",         // argv
+    "and rsp, ~15",         // align stack
+    "xor rbp, rbp",         // clear frame pointer
+    "call {main_trampoline}",
+    "ud2",                  // should never return
+    main_trampoline = sym main_trampoline
+);
+
+// OLD VERSION - remove this
+/*
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".text._start")]
+pub unsafe extern "C" fn _start() -> ! {
+    core::arch::asm!(
+        "pop rdi",              // argc
+        "mov rsi, rsp",         // argv
+        "and rsp, ~15",         // align
+        "call {main}",
+        main = sym main_trampoline,
+        options(noreturn)
+    )
+}
+*/
+
+extern "C" fn main_trampoline(argc: isize, argv: *const *const u8) -> ! {
+    install_sigchld_handler();
+
+    let mut worker_count: usize = 4; // Default 4 workers
+    let mut listen_ip: u32 = 0; // Default 0.0.0.0
+    let mut listen_port: usize = 8000; // Default port 8000
+
+    if argc > 1 {
+        let arg = unsafe { read_ptr_array(argv, 1) };
+        if let Some(n) = unsafe { parse_cstring_usize(arg) } {
+            worker_count = n;
+        }
+    }
+    if argc > 2 {
+        let ip_arg = unsafe { read_ptr_array(argv, 2) };
+        if let Some(v) = unsafe { parse_cstring_ip(ip_arg) } {
+            listen_ip = v;
+        }
+    }
+    if argc > 3 {
+        let port_arg = unsafe { read_ptr_array(argv, 3) };
+        if let Some(p) = unsafe { parse_cstring_usize(port_arg) } {
+            listen_port = p;
+        }
+    }
+
+    unsafe { crate::main(worker_count, listen_ip, listen_port) }
+}
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    syscall::exit(1);
+}
+
 unsafe extern "C" {
-    fn main(argc: isize, argv: *const *const u8) -> !;
+    fn main(worker_count: usize, listen_ip: u32, listen_port: usize) -> !;
 }

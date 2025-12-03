@@ -1,0 +1,51 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Embedded xterm</title>
+  <style>
+    html, body { height: 100%; margin: 0; background: #1e1e1e; }
+    #terminal { height: 100%; }
+  </style>
+  <!-- xterm.css CDN -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm/css/xterm.css" />
+</head>
+<body>
+  <div id="terminal"></div>
+
+  <!-- xterm.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/xterm/lib/xterm.min.js"></script>
+  <!-- xterm-addon-fit CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit/lib/xterm-addon-fit.min.js"></script>
+  <!-- xterm-addon-webgl CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-webgl/lib/xterm-addon-webgl.min.js"></script>
+
+  <script>
+    (function(){
+      const term = new Terminal({
+        convertEol: true,
+        cursorBlink: true,
+        fontFamily: "monospace",
+        theme: { background: "#1e1e1e" }
+      });
+      const fitAddon = new FitAddon.FitAddon();
+      const webglAddon = new WebglAddon.WebglAddon();
+      term.loadAddon(fitAddon);
+      term.open(document.getElementById("terminal"));
+      term.loadAddon(webglAddon);
+      fitAddon.fit();
+
+      const proto = location.protocol === "https:" ? "wss://" : "ws://";
+      const ws = new WebSocket(proto + location.host + "/term");
+      ws.binaryType = "arraybuffer";
+
+      ws.onmessage = e => term.write(new Uint8Array(e.data));
+      ws.onclose = () => term.write("\r\n[connection closed]\r\n");
+      ws.onerror = () => term.write("\r\n[connection error]\r\n");
+
+      term.onData(d => ws.send(new TextEncoder().encode(d)));
+      window.addEventListener("resize", () => { try { fitAddon.fit(); } catch(e){} });
+    })();
+  </script>
+</body>
+</html>
