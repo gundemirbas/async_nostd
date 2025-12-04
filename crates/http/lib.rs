@@ -55,6 +55,7 @@ pub async fn handle_http_connection(fd: i32) {
         async_runtime::log_write(b"[HTTP] fd=");
         sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), fd as usize);
         async_runtime::log_write(b" empty recv, closing\n");
+        async_runtime::unregister_fd(fd);
         let _ = sys::close(fd);
         return;
     }
@@ -105,5 +106,6 @@ pub async fn handle_http_connection(fd: i32) {
     async_runtime::log_write(b"[HTTP] fd=");
     sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), fd as usize);
     async_runtime::log_write(b" done, closing\n");
+    async_runtime::unregister_fd(fd);
     let _ = sys::close(fd);
 }

@@ -185,6 +185,24 @@ pub fn write_isize(fd: i32, mut n: i64) {
     let _ = write(fd, &buf[..len]);
 }
 
+/// Write a number as hexadecimal ASCII to `fd`.
+pub fn write_hex(fd: i32, n: usize) {
+    let mut buf = [0u8; 16];
+    let mut idx = 15;
+    let mut val = n;
+    if val == 0 {
+        let _ = write(fd, b"0");
+        return;
+    }
+    while val > 0 {
+        let digit = (val & 0xF) as u8;
+        buf[idx] = if digit < 10 { b'0' + digit } else { b'a' + (digit - 10) };
+        idx -= 1;
+        val >>= 4;
+    }
+    let _ = write(fd, &buf[(idx + 1)..]);
+}
+
 #[repr(C)]
 pub struct PollFd {
     pub fd: i32,
@@ -207,6 +225,7 @@ pub fn fcntl(fd: i32, cmd: i32, arg: usize) -> isize {
     unsafe { syscall3(72, fd as u64, cmd as u64, arg as u64) as isize }
 }
 
+pub const F_GETFL: i32 = 3;
 pub const F_SETFL: i32 = 4;
 pub const O_NONBLOCK: usize = 0x800;
 pub const O_WRONLY: i32 = 0x1;
@@ -350,7 +369,7 @@ pub fn nanosleep(seconds: u64) -> isize {
 /// Sleep for the given duration in nanoseconds using `nanosleep` syscall.
 pub fn nanosleep_ns(nanos: u64) -> isize {
     let sec = nanos / 1_000_000_000;
-    let nsec = (nanos % 1_000_000_000) as u64;
+    let nsec = nanos % 1_000_000_000;
     let ts = [sec, nsec];
     unsafe { syscall2(35, &ts as *const u64 as u64, 0) as isize }
 }

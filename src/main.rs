@@ -57,15 +57,47 @@ fn create_listening_socket(ip: u32, port: usize) -> Result<i32, ()> {
     Ok(sfd)
 }
 
-/// Callback invoked by acceptor thread for each accepted connection.
-extern "C" fn handle_accepted_connection(cfd: i32) {
-    async_runtime::log_write(b"[ACCEPT] fd=");
-    sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), cfd as usize);
-    async_runtime::log_write(b"\n");
+/// Async accept loop - continuously accepts connections and spawns handler tasks
+async fn accept_loop(sfd: i32) {
+    use async_net::AcceptFuture;
     
-    let task = alloc::boxed::Box::new(http::handle_http_connection(cfd));
-    let handle = async_runtime::register_task(task);
-    async_runtime::wake_handle(handle);
+    loop {
+        async_runtime::log_write(b"[ACCEPT_LOOP] calling AcceptFuture\n");
+        let cfd = AcceptFuture::new(sfd).await;
+        async_runtime::log_write(b"[ACCEPT_LOOP] got cfd=");
+        sys::write_isize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), cfd as i64);
+        async_runtime::log_write(b"\n");
+        
+        if cfd < 0 {
+            // Accept error, continue
+            async_runtime::log_write(b"[ACCEPT_LOOP] error, continuing\n");
+            continue;
+        }
+        
+        // Set non-blocking
+        let _ = sys::fcntl(cfd as i32, sys::F_SETFL, sys::O_NONBLOCK);
+        
+        async_runtime::log_write(b"[ACCEPT] fd=");
+        sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), cfd as usize);
+        async_runtime::log_write(b"\n");
+        
+        async_runtime::log_write(b"[ACCEPT] before Box::new\n");
+        
+        // Spawn handler task
+        let task = alloc::boxed::Box::new(http::handle_http_connection(cfd as i32));
+        
+        async_runtime::log_write(b"[ACCEPT] before register_task\n");
+        let handle = async_runtime::register_task(task);
+        
+        async_runtime::log_write(b"[ACCEPT] spawned handler, handle=");
+        sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), handle);
+        async_runtime::log_write(b"\n");
+        
+        async_runtime::log_write(b"[ACCEPT] before wake_handle\n");
+        async_runtime::wake_handle(handle);
+        
+        async_runtime::log_write(b"[ACCEPT] after wake_handle, loop continue\n");
+    }
 }
 
 /// Application entry point called by runtime after parsing argc/argv.
@@ -95,9 +127,14 @@ pub extern "C" fn main(worker_count: usize, listen_ip: u32, listen_port: usize) 
         Ok(fd) => fd,
         Err(_) => sys::exit(1),
     };
+    
+    // Set socket to non-blocking for async accept
+    let _ = sys::fcntl(sfd, sys::F_SETFL, sys::O_NONBLOCK);
 
-    // Spawn acceptor thread using runtime helper
-    let _ = async_runtime::spawn_acceptor_thread(sfd, handle_accepted_connection);
+    // Spawn accept loop as async task
+    let accept_task = alloc::boxed::Box::new(accept_loop(sfd));
+    let accept_handle = async_runtime::register_task(accept_task);
+    async_runtime::wake_handle(accept_handle);
     
     let executor = Executor::new();
     executor.start_workers(worker_count)

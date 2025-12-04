@@ -26,64 +26,11 @@ mod io_registry;
 mod scheduler;
 
 // Re-export public API
-pub use io_registry::{close_eventfd, register_fd_waker};
+pub use io_registry::{close_eventfd, register_fd_waker, unregister_fd};
 pub use scheduler::{
     create_waker, poll_task_safe, register_task, take_scheduled_task, wake_handle,
     is_handle_scheduled, dump_scheduled,
 };
-
-// Acceptor thread wrapper and helpers
-#[repr(C)]
-pub struct AcceptorThreadArg {
-    pub sfd: i32,
-    pub callback: extern "C" fn(i32),
-}
-
-/// C-compatible wrapper for acceptor thread.
-/// This is the entry point spawned by clone syscall.
-#[unsafe(no_mangle)]
-pub extern "C" fn acceptor_thread_wrapper(arg: *mut u8) {
-    let ptr = arg as *mut AcceptorThreadArg;
-    let arg_data = unsafe { core::ptr::read(ptr) };
-    unsafe { let _ = alloc::boxed::Box::from_raw(ptr); }
-    
-    run_acceptor_loop(arg_data.sfd, arg_data.callback);
-}
-
-/// The actual acceptor loop logic in Rust.
-/// Accepts connections and calls the callback for each accepted fd.
-fn run_acceptor_loop(sfd: i32, callback: extern "C" fn(i32)) {
-    // Set socket to blocking mode for accept
-    let _ = syscall::fcntl(sfd, syscall::F_SETFL, 0);
-    
-    loop {
-        let mut sa_buf = [0u8; 32];
-        let mut salen: usize = sa_buf.len();
-        let r = syscall::accept4(sfd, sa_buf.as_mut_ptr(), &mut salen as *mut usize, 0);
-        
-        if r >= 0 {
-            let cfd = r as i32;
-            // Set accepted socket to non-blocking for async I/O
-            let _ = syscall::fcntl(cfd, syscall::F_SETFL, syscall::O_NONBLOCK);
-            callback(cfd);
-        }
-        // On error, just continue (blocking accept will retry)
-    }
-}
-
-/// Spawn an acceptor thread with the given callback.
-pub fn spawn_acceptor_thread(sfd: i32, callback: extern "C" fn(i32)) {
-    let arg = alloc::boxed::Box::new(AcceptorThreadArg { sfd, callback });
-    let arg_ptr = alloc::boxed::Box::into_raw(arg) as *mut u8;
-    match syscall::spawn_thread(acceptor_thread_wrapper, arg_ptr, WORKER_STACK_SIZE) {
-        Ok(_) => {}
-        Err(e) => {
-            let _ = syscall::write(1, b"[spawn_acceptor] ERROR: Thread creation failed with code ");
-            syscall::write_usize(1, (-e) as usize);
-            let _ = syscall::write(1, b"\n");
-        }
-    }
-}
 
 // SIGCHLD handler installation
 fn install_sigchld_handler() {
@@ -129,7 +76,9 @@ pub fn ppoll_and_schedule() {
             revents: 0,
         });
     } else {
-        // No eventfd - can't wait for tasks, just return
+        // No eventfd - can't wait for tasks
+        // Sleep briefly to avoid busy-wait
+        let _ = syscall::nanosleep_ns(10_000_000); // 10ms
         return;
     }
     
@@ -165,23 +114,35 @@ pub fn ppoll_and_schedule() {
             // POLLERR=0x08, POLLHUP=0x10, POLLNVAL=0x20
             let is_closed = (pf.revents & 0x38) != 0;
             
+            // Log which fd and what events
+            log_write(b"[ppoll] fd=");
+            syscall::write_usize(LOG_FD.load(Ordering::Relaxed), pf.fd as usize);
+            log_write(b" revents=0x");
+            syscall::write_hex(LOG_FD.load(Ordering::Relaxed), pf.revents as usize);
+            log_write(b" closed=");
+            syscall::write_usize(LOG_FD.load(Ordering::Relaxed), if is_closed { 1 } else { 0 });
+            log_write(b"\n");
+            
             let mut to_wake: Vec<core::task::Waker> = Vec::new();
             {
                 let mut reg = io_registry::IO_REG.lock();
                 for i in 0..reg.len() {
                     if reg[i].fd == pf.fd {
+                        // Take wakers (will be re-registered on next poll if needed)
                         core::mem::swap(&mut to_wake, &mut reg[i].waiters);
+                        
+                        // Always remove entry - task will re-register if it needs to wait again
                         if is_closed {
-                            // Remove closed fd from registry
                             log_write(b"[ppoll] removing closed fd=");
                             syscall::write_usize(LOG_FD.load(Ordering::Relaxed), pf.fd as usize);
                             log_write(b"\n");
-                            reg.swap_remove(i);
                         }
+                        reg.swap_remove(i);
                         break;
                     }
                 }
             }
+            // Wake tasks - they will add new wakers on next poll
             for w in to_wake {
                 w.wake();
             }
@@ -335,7 +296,7 @@ pub unsafe extern "C" fn _start() -> ! {
 extern "C" fn main_trampoline(argc: isize, argv: *const *const u8) -> ! {
     install_sigchld_handler();
 
-    let mut worker_count: usize = 4; // Default 4 workers
+    let mut worker_count: usize = 16; // Default 16 workers
     let mut listen_ip: u32 = 0; // Default 0.0.0.0
     let mut listen_port: usize = 8000; // Default port 8000
 

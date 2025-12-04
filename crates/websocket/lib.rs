@@ -289,6 +289,7 @@ Type anything to see it echoed back!\r\n\r\n";
                 async_runtime::log_write(b"[WS] fd=");
                 sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), fd as usize);
                 async_runtime::log_write(b" client disconnected\n");
+                async_runtime::unregister_fd(fd);
                 let _ = sys::close(fd);
                 return;
             }
@@ -372,6 +373,9 @@ Type anything to see it echoed back!\r\n\r\n";
                         if op == 0x1 || op == 0x2 {
                             // echo back
                             send_ws_payload(fd, &full).await;
+                            // Send ping to keep connection alive
+                            let ping = [0x80 | 0x9, 0x00]; // FIN + ping opcode, 0 length
+                            let _ = SendFuture::new(fd, &ping).await;
                         }
                     }
                     continue;
@@ -381,6 +385,9 @@ Type anything to see it echoed back!\r\n\r\n";
                     if fin {
                         // single-frame message — echo
                         send_ws_payload(fd, &payload).await;
+                        // Send ping to keep connection alive
+                        let ping = [0x80 | 0x9, 0x00]; // FIN + ping opcode, 0 length
+                        let _ = SendFuture::new(fd, &ping).await;
                     } else {
                         // start fragmentation
                         frag_opcode = Some(opcode);
@@ -393,6 +400,7 @@ Type anything to see it echoed back!\r\n\r\n";
                 match opcode {
                     0x8 => {
                         // close
+                        async_runtime::unregister_fd(fd);
                         let _ = sys::close(fd);
                         return;
                     }
@@ -431,6 +439,7 @@ Type anything to see it echoed back!\r\n\r\n";
         async_runtime::log_write(b"[WS] fd=");
         sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), fd as usize);
         async_runtime::log_write(b" ERROR: No Sec-WebSocket-Key, closing\n");
+        async_runtime::unregister_fd(fd);
         let _ = sys::close(fd);
     }
 }

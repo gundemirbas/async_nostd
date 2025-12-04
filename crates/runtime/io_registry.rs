@@ -66,3 +66,12 @@ pub fn register_fd_waker(fd: i32, events: i16, waker: Waker) {
         waiters: v,
     });
 }
+
+pub fn unregister_fd(fd: i32) {
+    let mut reg = IO_REG.lock();
+    reg.retain(|e| e.fd != fd);
+    drop(reg); // Release lock before signal
+    
+    // Signal eventfd to wake up ppoll and refresh fd list
+    signal_eventfd();
+}

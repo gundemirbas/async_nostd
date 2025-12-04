@@ -36,6 +36,7 @@ impl Slot {
 
 static SLOTS: spin::Mutex<Option<Vec<Slot>>> = spin::Mutex::new(None);
 static FREE_SLOTS: spin::Mutex<Vec<usize>> = spin::Mutex::new(Vec::new());
+static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
 
 fn alloc_node(handle: usize) -> *mut Node {
     loop {
@@ -80,6 +81,7 @@ fn free_node(node: *mut Node) {
 }
 
 pub fn register_task(task: Box<dyn Future<Output = ()> + Send>) -> usize {
+    // Initialize slots if needed (only once at startup)
     {
         let mut slots_guard = SLOTS.lock();
         if slots_guard.is_none() {
@@ -91,26 +93,24 @@ pub fn register_task(task: Box<dyn Future<Output = ()> + Send>) -> usize {
         }
     }
 
-    let slot_idx = {
+    // Try to get a free slot from the freelist first
+    let slot_idx_opt = {
         let mut free = FREE_SLOTS.lock();
-        if let Some(idx) = free.pop() {
-            idx
-        } else {
-            drop(free);
-            let slots_guard = SLOTS.lock();
-            let slots = slots_guard.as_ref().unwrap();
-            let mut found_idx = None;
-            for (i, slot) in slots.iter().enumerate() {
-                if slot.inner.lock().is_none() {
-                    found_idx = Some(i);
-                    break;
-                }
-            }
-            drop(slots_guard);
-            found_idx.expect("No free task slots")
-        }
+        free.pop()
     };
 
+    let slot_idx = if let Some(idx) = slot_idx_opt {
+        idx
+    } else {
+        // Allocate new slot using atomic counter (lock-free)
+        let idx = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
+        if idx >= MAX_TASK_SLOTS {
+            panic!("No free task slots - max {} exceeded", MAX_TASK_SLOTS);
+        }
+        idx
+    };
+
+    // Assign task to slot
     let slots_guard = SLOTS.lock();
     let slots = slots_guard.as_ref().unwrap();
     let generation = slots[slot_idx].generation.fetch_add(1, Ordering::Relaxed);
@@ -193,18 +193,27 @@ pub fn poll_task_safe(handle: usize, cx: &mut Context<'_>) -> Poll<()> {
     let slot_idx = (handle >> 32) & 0x3FF;
     let generation = handle & 0xFFFFFFFF;
 
-    let slots_guard = SLOTS.lock();
-    let slots = slots_guard.as_ref().unwrap();
-    if slot_idx >= slots.len() {
-        return Poll::Ready(());
-    }
+    // Get slot pointer without holding SLOTS lock during poll
+    let slot_ptr = {
+        let slots_guard = SLOTS.lock();
+        let slots = slots_guard.as_ref().unwrap();
+        if slot_idx >= slots.len() {
+            return Poll::Ready(());
+        }
 
-    let cur_generation = slots[slot_idx].generation.load(Ordering::Relaxed);
-    if cur_generation != generation && cur_generation != generation + 1 {
-        return Poll::Ready(());
-    }
+        let cur_generation = slots[slot_idx].generation.load(Ordering::Relaxed);
+        if cur_generation != generation && cur_generation != generation + 1 {
+            return Poll::Ready(());
+        }
 
-    let mut guard = slots[slot_idx].inner.lock();
+        // Get raw pointer to slot (slots Vec is never dropped/moved)
+        &slots[slot_idx] as *const Slot
+    };
+    // SLOTS lock released here
+
+    // Poll task using slot pointer (safe: slots Vec is never dropped)
+    let slot = unsafe { &*slot_ptr };
+    let mut guard = slot.inner.lock();
     if let Some(task) = guard.as_mut() {
         let pin = unsafe { core::pin::Pin::new_unchecked(task.as_mut()) };
         let result = pin.poll(cx);
