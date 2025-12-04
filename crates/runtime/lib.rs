@@ -28,8 +28,8 @@ mod scheduler;
 // Re-export public API
 pub use io_registry::{close_eventfd, register_fd_waker, unregister_fd};
 pub use scheduler::{
-    create_waker, poll_task_safe, spawn, take_scheduled_task, wake_handle,
-    is_handle_scheduled, dump_scheduled,
+    create_waker, dump_scheduled, is_handle_scheduled, poll_task_safe, spawn, take_scheduled_task,
+    wake_handle,
 };
 
 /// Ergonomic spawn helper - automatically boxes the future and wakes it
@@ -59,7 +59,12 @@ fn install_sigchld_handler() {
     sigaction[2] = sa_restorer;
     sigaction[3..(3 + sa_mask.len())].copy_from_slice(&sa_mask);
 
-    let _ = syscall::rt_sigaction(17, sigaction.as_ptr() as *const u8, core::ptr::null_mut(), 8);
+    let _ = syscall::rt_sigaction(
+        17,
+        sigaction.as_ptr() as *const u8,
+        core::ptr::null_mut(),
+        8,
+    );
 }
 
 pub fn ppoll_and_schedule() {
@@ -79,7 +84,7 @@ pub fn ppoll_and_schedule() {
 
     let evt = io_registry::ensure_eventfd();
     let mut fds: Vec<syscall::PollFd> = Vec::new();
-    
+
     // Always include eventfd first (for task wake notifications)
     if evt >= 0 {
         fds.push(syscall::PollFd {
@@ -93,7 +98,7 @@ pub fn ppoll_and_schedule() {
         let _ = syscall::nanosleep_ns(10_000_000); // 10ms
         return;
     }
-    
+
     for (fd, ev) in snapshot.iter() {
         fds.push(syscall::PollFd {
             fd: *fd,
@@ -104,7 +109,7 @@ pub fn ppoll_and_schedule() {
 
     // Use infinite timeout ppoll - blocks until events are ready
     let ret = syscall::ppoll(fds.as_mut_ptr(), fds.len());
-    
+
     if ret <= 0 {
         // ppoll error or no events
         return;
@@ -125,16 +130,19 @@ pub fn ppoll_and_schedule() {
             ready_count += 1;
             // POLLERR=0x08, POLLHUP=0x10, POLLNVAL=0x20
             let is_closed = (pf.revents & 0x38) != 0;
-            
+
             // Log which fd and what events
             log_write(b"[ppoll] fd=");
             syscall::write_usize(LOG_FD.load(Ordering::Relaxed), pf.fd as usize);
             log_write(b" revents=0x");
             syscall::write_hex(LOG_FD.load(Ordering::Relaxed), pf.revents as usize);
             log_write(b" closed=");
-            syscall::write_usize(LOG_FD.load(Ordering::Relaxed), if is_closed { 1 } else { 0 });
+            syscall::write_usize(
+                LOG_FD.load(Ordering::Relaxed),
+                if is_closed { 1 } else { 0 },
+            );
             log_write(b"\n");
-            
+
             let mut to_wake: Vec<core::task::Waker> = Vec::new();
             {
                 let mut reg = io_registry::IO_REG.lock();
@@ -142,7 +150,7 @@ pub fn ppoll_and_schedule() {
                     if reg[i].fd == pf.fd {
                         // Take wakers (will be re-registered on next poll if needed)
                         core::mem::swap(&mut to_wake, &mut reg[i].waiters);
-                        
+
                         // Always remove entry - task will re-register if it needs to wait again
                         if is_closed {
                             log_write(b"[ppoll] removing closed fd=");
@@ -160,7 +168,7 @@ pub fn ppoll_and_schedule() {
             }
         }
     }
-    
+
     if ready_count > 0 {
         log_write(b"[ppoll] ");
         syscall::write_usize(LOG_FD.load(Ordering::Relaxed), ready_count);

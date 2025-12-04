@@ -196,7 +196,11 @@ pub fn write_hex(fd: i32, n: usize) {
     }
     while val > 0 {
         let digit = (val & 0xF) as u8;
-        buf[idx] = if digit < 10 { b'0' + digit } else { b'a' + (digit - 10) };
+        buf[idx] = if digit < 10 {
+            b'0' + digit
+        } else {
+            b'a' + (digit - 10)
+        };
         idx -= 1;
         val >>= 4;
     }

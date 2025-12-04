@@ -32,7 +32,7 @@ pub fn parse_websocket_frame(buf: &[u8]) -> Option<(usize, bool, u8, Vec<u8>)> {
     if buf.len() < 2 {
         return None;
     }
-    
+
     let b1 = buf[0];
     let b2 = buf[1];
     let fin = (b1 & 0x80) != 0;
@@ -40,7 +40,7 @@ pub fn parse_websocket_frame(buf: &[u8]) -> Option<(usize, bool, u8, Vec<u8>)> {
     let masked = (b2 & 0x80) != 0;
     let mut payload_len = (b2 & 0x7f) as usize;
     let mut pos = 2usize;
-    
+
     if payload_len == 126 {
         if buf.len() < pos + 2 {
             return None;
@@ -57,7 +57,7 @@ pub fn parse_websocket_frame(buf: &[u8]) -> Option<(usize, bool, u8, Vec<u8>)> {
             pos += 1;
         }
     }
-    
+
     let mask_key_pos = pos;
     if masked {
         if buf.len() < pos + 4 {
@@ -65,12 +65,12 @@ pub fn parse_websocket_frame(buf: &[u8]) -> Option<(usize, bool, u8, Vec<u8>)> {
         }
         pos += 4;
     }
-    
+
     let frame_total = pos + payload_len;
     if buf.len() < frame_total {
         return None;
     }
-    
+
     let mut payload = Vec::new();
     if payload_len > 0 {
         payload.extend_from_slice(&buf[pos..pos + payload_len]);
@@ -81,7 +81,7 @@ pub fn parse_websocket_frame(buf: &[u8]) -> Option<(usize, bool, u8, Vec<u8>)> {
             payload[i] ^= key[i & 3];
         }
     }
-    
+
     Some((frame_total, fin, opcode, payload))
 }
 
@@ -89,7 +89,7 @@ pub fn parse_websocket_frame(buf: &[u8]) -> Option<(usize, bool, u8, Vec<u8>)> {
 pub fn build_websocket_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(0x80 | opcode);
-    
+
     let l = payload.len();
     if l < 126 {
         out.push(l as u8);

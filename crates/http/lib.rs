@@ -45,21 +45,27 @@ pub fn http_response_headers(status: &str, content_type: &str, content_len: usiz
 
 pub async fn handle_http_connection(fd: i32) {
     async_runtime::log_write(b"[HTTP] fd=");
-    sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), fd as usize);
+    sys::write_usize(
+        async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed),
+        fd as usize,
+    );
     async_runtime::log_write(b" recv request\n");
-    
+
     // read request - may need multiple reads for WebSocket handshake
     let mut buf = RecvFuture::new(fd, 2048).await;
-    
+
     if buf.is_empty() {
         async_runtime::log_write(b"[HTTP] fd=");
-        sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), fd as usize);
+        sys::write_usize(
+            async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed),
+            fd as usize,
+        );
         async_runtime::log_write(b" empty recv, closing\n");
         async_runtime::unregister_fd(fd);
         let _ = sys::close(fd);
         return;
     }
-    
+
     // Check if we have complete HTTP request (ends with \r\n\r\n)
     let has_complete_headers = buf.windows(4).any(|w| w == b"\r\n\r\n");
     if !has_complete_headers && buf.len() == 2048 {
@@ -73,9 +79,12 @@ pub async fn handle_http_connection(fd: i32) {
     if buf.starts_with(b"GET / ") || buf.starts_with(b"GET /HTTP") || buf.starts_with(b"GET / HTTP")
     {
         async_runtime::log_write(b"[HTTP] fd=");
-        sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), fd as usize);
+        sys::write_usize(
+            async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed),
+            fd as usize,
+        );
         async_runtime::log_write(b" route=/ (index)\n");
-        
+
         let mut resp =
             http_response_headers("200 OK", "text/html; charset=utf-8", INDEX_HTML.len());
         resp.extend_from_slice(INDEX_HTML);
@@ -86,25 +95,34 @@ pub async fn handle_http_connection(fd: i32) {
         || buf.starts_with(b"GET /ws")
     {
         async_runtime::log_write(b"[HTTP] fd=");
-        sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), fd as usize);
+        sys::write_usize(
+            async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed),
+            fd as usize,
+        );
         async_runtime::log_write(b" route=/ws (websocket upgrade)\n");
-        
+
         // WebSocket endpoint for terminal
         // NOTE: WebSocket handler manages fd lifetime, doesn't return until connection closes
         async_websocket::accept_and_run(fd, &buf).await;
         return;
     } else {
         async_runtime::log_write(b"[HTTP] fd=");
-        sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), fd as usize);
+        sys::write_usize(
+            async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed),
+            fd as usize,
+        );
         async_runtime::log_write(b" route=unknown (404)\n");
-        
+
         let body = b"Not Found\n";
         let mut resp = http_response_headers("404 Not Found", "text/plain", body.len());
         resp.extend_from_slice(body);
         let _ = SendFuture::new(fd, &resp).await;
     }
     async_runtime::log_write(b"[HTTP] fd=");
-    sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), fd as usize);
+    sys::write_usize(
+        async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed),
+        fd as usize,
+    );
     async_runtime::log_write(b" done, closing\n");
     async_runtime::unregister_fd(fd);
     let _ = sys::close(fd);

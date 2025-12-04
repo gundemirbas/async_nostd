@@ -2,8 +2,8 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::future::Future;
 use async_syscall as sys;
+use core::future::Future;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
@@ -129,9 +129,9 @@ pub fn wake_handle(handle: usize) {
             .compare_exchange(head, node, Ordering::Release, Ordering::Acquire)
             .is_ok()
         {
-                // Wake the eventfd to notify pollers that work is available.
-                crate::io_registry::signal_eventfd();
-                return;
+            // Wake the eventfd to notify pollers that work is available.
+            crate::io_registry::signal_eventfd();
+            return;
         }
     }
 }

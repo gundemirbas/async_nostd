@@ -41,7 +41,11 @@ impl Executor {
         }
 
         for _ in 0..num_workers {
-            let _ = async_syscall::spawn_thread(worker_wrapper, core::ptr::null_mut(), async_runtime::WORKER_STACK_SIZE);
+            let _ = async_syscall::spawn_thread(
+                worker_wrapper,
+                core::ptr::null_mut(),
+                async_runtime::WORKER_STACK_SIZE,
+            );
         }
         // Main thread becomes a worker too
         worker_loop(core::ptr::null_mut())
@@ -61,7 +65,7 @@ extern "C" fn worker_loop(_arg: *mut u8) -> ! {
         if let Some(handle) = async_runtime::take_scheduled_task() {
             let waker = async_runtime::create_waker(handle);
             let mut cx = Context::from_waker(&waker);
-            
+
             let result = async_runtime::poll_task_safe(handle, &mut cx);
             match result {
                 Poll::Ready(_) => {
