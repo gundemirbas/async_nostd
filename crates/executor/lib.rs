@@ -30,7 +30,7 @@ impl Executor {
     }
 
     pub fn enqueue_task(&self, task: Box<dyn Future<Output = ()> + Send + 'static>) {
-        let _ = async_runtime::register_task(task);
+        let _ = async_runtime::spawn(task);
         TASKS_REMAINING.fetch_add(1, Ordering::Relaxed);
     }
 

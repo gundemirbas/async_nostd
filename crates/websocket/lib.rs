@@ -1,154 +1,18 @@
-//! Minimal WebSocket implementation: SHA1 + base64, handshake and echo framing.
+//! WebSocket server implementation
 
 #![no_std]
 
 extern crate alloc;
-use alloc::string::String;
 use alloc::vec::Vec;
 use async_net::{RecvFuture, SendFuture};
 use async_syscall as sys;
+use async_utils::{crypto, parsing};
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-fn rol(v: u32, s: u32) -> u32 {
-    v.rotate_left(s)
-}
-
-fn sha1(input: &[u8]) -> [u8; 20] {
-    let mut h0: u32 = 0x67452301;
-    let mut h1: u32 = 0xEFCDAB89;
-    let mut h2: u32 = 0x98BADCFE;
-    let mut h3: u32 = 0x10325476;
-    let mut h4: u32 = 0xC3D2E1F0;
-
-    let bit_len = (input.len() as u64) * 8;
-
-    // build padded message
-    let mut msg = Vec::from(input);
-    msg.push(0x80);
-    while (msg.len() % 64) != 56 {
-        msg.push(0);
-    }
-    // append 64-bit big-endian length
-    for i in (0..8).rev() {
-        msg.push(((bit_len >> (i * 8)) & 0xff) as u8);
-    }
-
-    let mut w = [0u32; 80];
-    for chunk in msg.chunks(64) {
-        for (i, item) in w.iter_mut().enumerate().take(16) {
-            let j = i * 4;
-            *item = ((chunk[j] as u32) << 24)
-                | ((chunk[j + 1] as u32) << 16)
-                | ((chunk[j + 2] as u32) << 8)
-                | (chunk[j + 3] as u32);
-        }
-        for i in 16..80 {
-            w[i] = rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
-        }
-
-        let mut a = h0;
-        let mut b = h1;
-        let mut c = h2;
-        let mut d = h3;
-        let mut e = h4;
-
-        for (i, &wi) in w.iter().enumerate() {
-            let (f, k) = if i < 20 {
-                ((b & c) | ((!b) & d), 0x5A827999)
-            } else if i < 40 {
-                (b ^ c ^ d, 0x6ED9EBA1)
-            } else if i < 60 {
-                ((b & c) | (b & d) | (c & d), 0x8F1BBCDC)
-            } else {
-                (b ^ c ^ d, 0xCA62C1D6)
-            };
-            let temp = rol(a, 5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(wi);
-            e = d;
-            d = c;
-            c = rol(b, 30);
-            b = a;
-            a = temp;
-        }
-
-        h0 = h0.wrapping_add(a);
-        h1 = h1.wrapping_add(b);
-        h2 = h2.wrapping_add(c);
-        h3 = h3.wrapping_add(d);
-        h4 = h4.wrapping_add(e);
-    }
-
-    let mut out = [0u8; 20];
-    out[0..4].copy_from_slice(&h0.to_be_bytes());
-    out[4..8].copy_from_slice(&h1.to_be_bytes());
-    out[8..12].copy_from_slice(&h2.to_be_bytes());
-    out[12..16].copy_from_slice(&h3.to_be_bytes());
-    out[16..20].copy_from_slice(&h4.to_be_bytes());
-    out
-}
-
-fn base64_encode(src: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    let mut i = 0;
-    while i + 3 <= src.len() {
-        let a = src[i] as u32;
-        let b = src[i + 1] as u32;
-        let c = src[i + 2] as u32;
-        let triple = (a << 16) | (b << 8) | c;
-        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
-        out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
-        out.push(TABLE[(triple & 0x3F) as usize] as char);
-        i += 3;
-    }
-    let rem = src.len() - i;
-    if rem == 1 {
-        let a = src[i] as u32;
-        let triple = a << 16;
-        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
-        out.push('=');
-        out.push('=');
-    } else if rem == 2 {
-        let a = src[i] as u32;
-        let b = src[i + 1] as u32;
-        let triple = (a << 16) | (b << 8);
-        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
-        out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
-        out.push('=');
-    }
-    out
-}
-
-fn find_header_val<'a>(req: &'a [u8], name: &str) -> Option<&'a [u8]> {
-    let needle = name.as_bytes();
-    let mut i = 0;
-    while i + needle.len() < req.len() {
-        if req[i..i + needle.len()].eq(needle) {
-            // skip name and possible colon/space
-            let mut j = i + needle.len();
-            while j < req.len() && (req[j] == b':' || req[j] == b' ') {
-                j += 1;
-            }
-            // read until CRLF
-            let mut k = j;
-            while k + 1 < req.len() {
-                if req[k] == b'\r' && req[k + 1] == b'\n' {
-                    break;
-                }
-                k += 1;
-            }
-            return Some(&req[j..k]);
-        }
-        i += 1;
-    }
-    None
+/// Public API: Accept WebSocket connection
+pub async fn accept_connection(fd: i32, request: &[u8]) {
+    accept_and_run(fd, request).await
 }
 
 async fn send_ws_payload(fd: i32, payload: &[u8]) {
@@ -193,7 +57,7 @@ pub async fn accept_and_run(fd: i32, request: &[u8]) {
     async_runtime::log_write(b" handshake start\n");
     
     // find Sec-WebSocket-Key header
-    if let Some(key_bytes) = find_header_val(request, "Sec-WebSocket-Key") {
+    if let Some(key_bytes) = parsing::find_header_value(request, "Sec-WebSocket-Key") {
         // trim whitespace
         let mut key_trim = key_bytes;
         while !key_trim.is_empty() && key_trim[0] == b' ' {
@@ -202,11 +66,11 @@ pub async fn accept_and_run(fd: i32, request: &[u8]) {
         while !key_trim.is_empty() && (key_trim[key_trim.len() - 1] == b' ') {
             key_trim = &key_trim[..key_trim.len() - 1];
         }
-        // compute accept
+        // compute accept using utils
         let mut combined = Vec::from(key_trim);
         combined.extend_from_slice(WS_GUID.as_bytes());
-        let digest = sha1(&combined);
-        let accept = base64_encode(&digest);
+        let digest = crypto::sha1(&combined);
+        let accept = crypto::base64_encode(&digest);
 
         let mut resp = Vec::new();
         resp.extend_from_slice(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ");
@@ -303,129 +167,72 @@ Type anything to see it echoed back!\r\n\r\n";
             // parse as many frames as available
             let mut parsed_any = false;
             loop {
-                if buf_acc.len() < 2 {
-                    break;
-                }
-                let b1 = buf_acc[0];
-                let b2 = buf_acc[1];
-                let fin = (b1 & 0x80) != 0;
-                let opcode = b1 & 0x0f;
-                let masked = (b2 & 0x80) != 0;
-                let mut payload_len = (b2 & 0x7f) as usize;
-                let mut pos = 2usize;
-                if payload_len == 126 {
-                    if buf_acc.len() < pos + 2 {
-                        break;
-                    }
-                    payload_len = ((buf_acc[pos] as usize) << 8) | (buf_acc[pos + 1] as usize);
-                    pos += 2;
-                } else if payload_len == 127 {
-                    if buf_acc.len() < pos + 8 {
-                        break;
-                    }
-                    payload_len = 0usize;
-                    for _ in 0..8 {
-                        payload_len = (payload_len << 8) | (buf_acc[pos] as usize);
-                        pos += 1;
-                    }
-                }
-                let mask_key_pos = pos;
-                if masked {
-                    if buf_acc.len() < pos + 4 {
-                        break;
-                    }
-                    pos += 4;
-                }
-                let frame_total = pos + payload_len;
-                if buf_acc.len() < frame_total {
-                    break;
-                }
+                match parsing::parse_websocket_frame(&buf_acc) {
+                    Some((consumed, fin, opcode, payload)) => {
+                        // remove consumed bytes
+                        let _ = buf_acc.drain(0..consumed);
+                        parsed_any = true;
 
-                // extract payload
-                let mut payload = Vec::new();
-                if payload_len > 0 {
-                    payload.extend_from_slice(&buf_acc[pos..pos + payload_len]);
-                }
-                if masked {
-                    let key = &buf_acc[mask_key_pos..mask_key_pos + 4];
-                    for i in 0..payload_len {
-                        payload[i] ^= key[i & 3];
-                    }
-                }
-
-                // remove consumed bytes
-                let _ = buf_acc.drain(0..frame_total);
-                parsed_any = true;
-
-                // handle fragmentation
-                if opcode == 0x0 {
-                    // continuation
-                    if frag_opcode.is_none() {
-                        // unexpected continuation, ignore
-                        continue;
-                    }
-                    frag_payload.extend_from_slice(&payload);
-                    if fin {
-                        // finalize
-                        let op = frag_opcode.take().unwrap();
-                        let full = core::mem::take(&mut frag_payload);
-                        // echo as text/binary based on op
-                        if op == 0x1 || op == 0x2 {
-                            // echo back
-                            send_ws_payload(fd, &full).await;
-                            // Send ping to keep connection alive
-                            let ping = [0x80 | 0x9, 0x00]; // FIN + ping opcode, 0 length
-                            let _ = SendFuture::new(fd, &ping).await;
+                        // handle fragmentation
+                        if opcode == 0x0 {
+                            // continuation
+                            if frag_opcode.is_none() {
+                                // unexpected continuation, ignore
+                                continue;
+                            }
+                            frag_payload.extend_from_slice(&payload);
+                            if fin {
+                                // finalize
+                                let op = frag_opcode.take().unwrap();
+                                let full = core::mem::take(&mut frag_payload);
+                                // echo as text/binary based on op
+                                if op == 0x1 || op == 0x2 {
+                                    // echo back
+                                    send_ws_payload(fd, &full).await;
+                                    // Send ping to keep connection alive
+                                    let ping = [0x80 | 0x9, 0x00]; // FIN + ping opcode, 0 length
+                                    let _ = SendFuture::new(fd, &ping).await;
+                                }
+                            }
+                            continue;
                         }
-                    }
-                    continue;
-                }
 
-                if opcode == 0x1 || opcode == 0x2 {
-                    if fin {
-                        // single-frame message — echo
-                        send_ws_payload(fd, &payload).await;
-                        // Send ping to keep connection alive
-                        let ping = [0x80 | 0x9, 0x00]; // FIN + ping opcode, 0 length
-                        let _ = SendFuture::new(fd, &ping).await;
-                    } else {
-                        // start fragmentation
-                        frag_opcode = Some(opcode);
-                        frag_payload.clear();
-                        frag_payload.extend_from_slice(&payload);
-                    }
-                    continue;
-                }
+                        if opcode == 0x1 || opcode == 0x2 {
+                            if fin {
+                                // single-frame message — echo
+                                send_ws_payload(fd, &payload).await;
+                                // Send ping to keep connection alive
+                                let ping = [0x80 | 0x9, 0x00]; // FIN + ping opcode, 0 length
+                                let _ = SendFuture::new(fd, &ping).await;
+                            } else {
+                                // start fragmentation
+                                frag_opcode = Some(opcode);
+                                frag_payload.clear();
+                                frag_payload.extend_from_slice(&payload);
+                            }
+                            continue;
+                        }
 
-                match opcode {
-                    0x8 => {
-                        // close
-                        async_runtime::unregister_fd(fd);
-                        let _ = sys::close(fd);
-                        return;
-                    }
-                    0x9 => {
-                        // ping -> pong
-                        let mut out = Vec::new();
-                        out.push(0x80 | 0xA);
-                        let l = payload.len();
-                        if l < 126 {
-                            out.push(l as u8);
-                        } else if l < 65536 {
-                            out.push(126);
-                            out.push(((l >> 8) & 0xff) as u8);
-                            out.push((l & 0xff) as u8);
-                        } else {
-                            out.push(127);
-                            for i in (0..8).rev() {
-                                out.push(((l >> (i * 8)) & 0xff) as u8);
+                        match opcode {
+                            0x8 => {
+                                // close
+                                async_runtime::unregister_fd(fd);
+                                let _ = sys::close(fd);
+                                return;
+                            }
+                            0x9 => {
+                                // ping -> pong (opcode 0xA)
+                                let pong = parsing::build_websocket_frame(0xA, &payload);
+                                let _ = SendFuture::new(fd, &pong).await;
+                            }
+                            _ => {
+                                // ignore other opcodes
                             }
                         }
-                        out.extend_from_slice(&payload);
-                        let _ = SendFuture::new(fd, &out).await;
                     }
-                    _ => {
-                        // ignore other opcodes
+                    None => {
+                        // incomplete frame, need more data
+                        break;
                     }
                 }
             }

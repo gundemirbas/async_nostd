@@ -14,6 +14,7 @@ async-executor = { path = "crates/executor" }
 async-net = { path = "crates/net" }
 async-http = { path = "crates/http" }
 async-websocket = { path = "crates/websocket" }
+async-utils = { path = "crates/utils" }
 
 [profile.dev]
 panic = "abort"

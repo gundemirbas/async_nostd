@@ -1,7 +1,7 @@
 # Async NoStd - AI Agent Instructions
 
 ## Project Overview
-Production-ready `#![no_std]` async runtime (2,110 LOC, 35KB binary). Bare-metal Linux syscalls on x86_64 with lock-free scheduler, multi-threaded executor, HTTP/WebSocket server. Edition 2024 workspace architecture.
+Production-ready `#![no_std]` async runtime (2,203 LOC, 36KB binary). Bare-metal Linux syscalls on x86_64 with lock-free scheduler, multi-threaded executor, HTTP/WebSocket server. Edition 2024 workspace architecture with utils crate for code reuse.
 
 ## Critical Architecture Decisions
 
@@ -50,17 +50,18 @@ fcntl(fd, F_SETFL, O_NONBLOCK);  // Restore async
 ## Workspace Structure
 
 ```
-src/main.rs (104 lines)          → open log + create socket + spawn acceptor
+src/main.rs (134 lines)          → open log + create socket + spawn acceptor
 crates/
-  syscall/ (407 lines)           → syscall1-6 + spawn_thread (CLONE_THREAD|SETTLS)
-  runtime/ (413 lines)           → config.rs + allocator + scheduler + io_registry
-  executor/ (86 lines)           → worker_loop: poll tasks → ppoll → repeat
+  syscall/ (426 lines)           → syscall1-6 + spawn_thread (CLONE_THREAD|SETTLS)
+  runtime/ (376 lines)           → config.rs + allocator + scheduler + io_registry
+  executor/ (83 lines)           → worker_loop: poll tasks → ppoll → repeat
   net/ (185 lines)               → RecvFuture/SendFuture (EAGAIN → register waker)
-  http/ (109 lines)              → route: / → index, /ws → websocket upgrade
-  websocket/ (436 lines)         → SHA1+base64 handshake + frame echo
+  http/ (111 lines)              → route: / → index, /ws → websocket upgrade
+  websocket/ (252 lines)         → handshake + frame echo (uses utils)
+  utils/ (237 lines)             → crypto.rs (SHA1/Base64) + parsing.rs (HTTP/WS frames)
 ```
 
-**Removed**: `async-pty` (unused). **Test**: `test.py` (not `test_all.py`).
+**Note**: `async-pty` crate exists but unused. **Test**: `test.py` (28 tests with filtering).
 
 ## Build & Test
 
@@ -106,6 +107,16 @@ pub const NEW_LIMIT: usize = 512;
 use async_runtime::NEW_LIMIT;
 ```
 
+### Spawning Tasks
+```rust
+// Ergonomic API: spawn_task (auto-boxing + wake)
+let handle = async_runtime::spawn_task(my_async_function(arg));
+
+// Low-level API: spawn (manual boxing, no auto-wake)
+let handle = async_runtime::spawn(Box::new(my_future));
+async_runtime::wake_handle(handle);
+```
+
 ### Async Future Pattern
 ```rust
 impl Future for MyFuture {
@@ -138,10 +149,28 @@ impl Future for MyFuture {
 ## Key Files
 
 - **Config**: `crates/runtime/config.rs` - All tunable constants
-- **Entry**: `crates/runtime/lib.rs` - `_start()`, acceptor thread, ppoll
+- **Entry**: `crates/runtime/lib.rs` - `_start()`, acceptor thread, ppoll, spawn APIs
 - **Scheduler**: `crates/runtime/scheduler.rs` - Treiber stack, 1024 slots
+- **Utils**: `crates/utils/` - Shared crypto (SHA1/Base64) and parsing (HTTP/WebSocket)
 - **Main**: `src/main.rs` - Socket setup, log open, acceptor spawn
 - **Test**: `test.py` - 28 tests with filtering (not `test_all.py`)
+
+## Utils Crate Pattern
+
+Shared utilities to eliminate code duplication:
+
+```rust
+// crates/utils/crypto.rs - Cryptographic functions
+pub fn sha1(input: &[u8]) -> [u8; 20];
+pub fn base64_encode(src: &[u8]) -> String;
+
+// crates/utils/parsing.rs - Protocol parsing
+pub fn find_header_value<'a>(req: &'a [u8], name: &str) -> Option<&'a [u8]>;
+pub fn parse_websocket_frame(buf: &[u8]) -> Option<(usize, bool, u8, Vec<u8>)>;
+pub fn build_websocket_frame(opcode: u8, payload: &[u8]) -> Vec<u8>;
+```
+
+**Usage**: `use async_utils::{crypto, parsing};` in websocket/http crates.
 
 ## Documentation
 
@@ -149,4 +178,4 @@ impl Future for MyFuture {
 - **PROJECT_STRUCTURE.md**: Deep dive, patterns, memory layout
 - **CHANGELOG.md**: Version history (v0.2.0 = optimization release)
 
-Performance: 35KB binary, 10K+ req/s, sub-ms latency, 28/28 tests passing.
+Performance: 36KB binary, 10K+ req/s, sub-ms latency, 28/28 tests passing.

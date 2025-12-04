@@ -81,13 +81,8 @@ async fn accept_loop(sfd: i32) {
         sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), cfd as usize);
         async_runtime::log_write(b"\n");
         
-        async_runtime::log_write(b"[ACCEPT] before Box::new\n");
-        
         // Spawn handler task
-        let task = alloc::boxed::Box::new(http::handle_http_connection(cfd as i32));
-        
-        async_runtime::log_write(b"[ACCEPT] before register_task\n");
-        let handle = async_runtime::register_task(task);
+        let handle = async_runtime::spawn_task(http::handle_http_connection(cfd as i32));
         
         async_runtime::log_write(b"[ACCEPT] spawned handler, handle=");
         sys::write_usize(async_runtime::LOG_FD.load(core::sync::atomic::Ordering::Relaxed), handle);
@@ -132,9 +127,7 @@ pub extern "C" fn main(worker_count: usize, listen_ip: u32, listen_port: usize) 
     let _ = sys::fcntl(sfd, sys::F_SETFL, sys::O_NONBLOCK);
 
     // Spawn accept loop as async task
-    let accept_task = alloc::boxed::Box::new(accept_loop(sfd));
-    let accept_handle = async_runtime::register_task(accept_task);
-    async_runtime::wake_handle(accept_handle);
+    let _accept_handle = async_runtime::spawn_task(accept_loop(sfd));
     
     let executor = Executor::new();
     executor.start_workers(worker_count)

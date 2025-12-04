@@ -28,9 +28,21 @@ mod scheduler;
 // Re-export public API
 pub use io_registry::{close_eventfd, register_fd_waker, unregister_fd};
 pub use scheduler::{
-    create_waker, poll_task_safe, register_task, take_scheduled_task, wake_handle,
+    create_waker, poll_task_safe, spawn, take_scheduled_task, wake_handle,
     is_handle_scheduled, dump_scheduled,
 };
+
+/// Ergonomic spawn helper - automatically boxes the future and wakes it
+#[inline]
+pub fn spawn_task<F>(future: F) -> usize
+where
+    F: core::future::Future<Output = ()> + Send + 'static,
+{
+    use alloc::boxed::Box;
+    let handle = spawn(Box::new(future));
+    wake_handle(handle);
+    handle
+}
 
 // SIGCHLD handler installation
 fn install_sigchld_handler() {

@@ -10,3 +10,4 @@ path = "lib.rs"
 async-syscall = { path = "../syscall" }
 async-runtime = { path = "../runtime" }
 async-net = { path = "../net" }
+async-utils = { path = "../utils" }

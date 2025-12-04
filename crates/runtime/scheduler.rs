@@ -80,7 +80,8 @@ fn free_node(node: *mut Node) {
     }
 }
 
-pub fn register_task(task: Box<dyn Future<Output = ()> + Send>) -> usize {
+/// Spawn a new async task
+pub fn spawn(task: Box<dyn Future<Output = ()> + Send>) -> usize {
     // Initialize slots if needed (only once at startup)
     {
         let mut slots_guard = SLOTS.lock();
